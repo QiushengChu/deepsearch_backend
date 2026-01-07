@@ -3,10 +3,13 @@ from fastapi.responses import JSONResponse
 from model.session_manager import manager
 import json
 import asyncio
-from model.async_deep_search_agent import invoke
-from model.request_models import UserClarify
+from utils.context_retriver import context_retriveral
 from model.prompt_cache_model import prompt_cache
-from model.memory import memory
+from utils.llm_invoke import invoke
+from model.memory import checkpointer_manager
+from dotenv import load_dotenv
+
+load_dotenv()
 ws_router = APIRouter()
 
 
@@ -41,6 +44,7 @@ async def run_workflow_with_generator(thread_id: str, user_message: str):
 @ws_router.websocket("/ws/{thread_id}")
 async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     await manager.connect(websocket=websocket, thread_id=thread_id)
+    await context_retriveral(thread_id=thread_id)
     try:
         while True:
             data = await websocket.receive_text()
@@ -76,9 +80,19 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
         # await memory.
    
 
-# @ws_router.post("/user_clarify")
-# def post_user_clarify(request: UserClarify):
-#     prompt_list = prompt_cache.session.get(request.thread_id, [])
-#     prompt_list.append({"type": request.type, "message": request.message})
-#     prompt_cache.session[request.thread_id] = prompt_list
-#     return JSONResponse(content="user prompt add successfully", status_code=status.HTTP_200_OK)
+# @ws_router.delete("/api/{session_id}")
+# async def delete_session(session_id: str)->JSONResponse:
+#     result = await checkpointer_manager.remove_thread(session_id=session_id)
+#     if result["result"] == True:
+#         return JSONResponse(status_code=status.HTTP_200_OK, content={
+#             "status": f"{session_id} has been removed from long-term memory"
+#         })
+#     elif result["result"] == False:
+#         return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={
+#             "error": f"{session_id} is not valid"
+#         })
+#     else:
+#         return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={
+#             "error": result["message"]
+#         })
+

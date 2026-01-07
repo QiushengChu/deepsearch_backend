@@ -1,12 +1,28 @@
 from fastapi import FastAPI
 import uvicorn
-from model.request_models import ChatRequest
-from model.response_models import SessionStatusResponse
 import uuid
 from routes.ws_routes import ws_router
+from routes.session_routes import session_router
+from utils.agent_setup import agent_compile
+from fastapi.middleware.cors import CORSMiddleware
+from model.sqlite import create_tables
+
 
 app = FastAPI()
 app.include_router(ws_router)
+app.include_router(session_router)
+
+origins = ["*"]
+
+app.add_middleware(CORSMiddleware, allow_origins=origins)
+
+
+@app.on_event("startup")
+async def startup():
+    await create_tables()
+    await agent_compile()
+    # chromadb_client = Chromadb_agent()
+
 
 @app.get("/")
 def read_root():
