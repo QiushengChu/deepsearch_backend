@@ -49,13 +49,12 @@ async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Litera
     - sender == "clarify_agent" → Route to "topic_summary_app" (ONLY when the conversation is complex you need to break the conversation into a few topics)
     - sender == "topic_summary_agent" → Route to "search_app"
     - sender == "search_agent" → Route to "report_writer_app"             
-    - sender == "report_writer_agent" → Route to "__end__"
     
     Sub-agent targets:
     "clarify_agent": if user's request is not clear enough to do the search, clarify agent will be used to clarify research detail with user
     "topic_summary_agent": based on the previous conversation break conversation down into a few topics and also if previous search topics are sufficient, providing more research topics
     "search_agent": "based on search topics, using associated search tool for finding relevant information"
-    "report_writer_agent": summarize all the important details with some valid assumption and to write a report
+    "report_writer_agent": summarize all the important details with some valid assumption and to write a report or generate a quick answer
     "file_search_agent": if user has file uploaded, there might be relevant content to use
 
     This is a research question. Please be CRITICAL. Route to "clarify_app" to start the workflow if the question is not clear otherwise you can use search tool to gather real information from the true source.

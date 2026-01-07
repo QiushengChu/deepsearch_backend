@@ -38,7 +38,12 @@ def context_purifier(state_messages: Sequence[BaseMessage])->Sequence[BaseMessag
 def prompt_fetcher_from_cache(thread_id: str)->list[HumanMessage]:
     prompt_list = prompt_cache.session[thread_id]
     if prompt_list:
-        human_message_list = [HumanMessage(content=each['message']) for each in prompt_list]
+        human_message_list = [HumanMessage(
+            content=each['message'],
+            additional_kwargs={
+                "file_names": each.file_names
+            }
+        ) for each in prompt_list]
         return human_message_list
     return []
     

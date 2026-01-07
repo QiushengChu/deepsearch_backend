@@ -22,6 +22,7 @@ async def context_retriveral(thread_id: str):
                     "type": "human_input", 
                     "sender": "human",
                     "content": message.content,
+                    "fileNames": message.additional_kwargs["file_names"],
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "total_tokens": 0

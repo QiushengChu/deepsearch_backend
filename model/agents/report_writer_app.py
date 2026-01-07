@@ -26,8 +26,8 @@ async def report_writer_agent(state: Report_Writer_State)-> Command[Literal["__e
     '''
     The report write agent is for summarizing the search results into a small report
     '''
-    system_prompt = "You are professional report writer good at summarizing the previous conversation and search result into a formal report. " \
-    "Please make sure you can complete the task and DONT add any fake information there, unless it is a educated guess. Please note the information are enough for you to generate a report and generate the report DIRECTLY."
+    system_prompt = "You are professional report writer good at summarizing the previous conversation and search result into a formal report and also quick responder." \
+    "Please make sure you can complete the task and DONT add any fake information there, unless it is a educated guess. Please note the information are enough for you to generate a report and generate the report DIRECTLY. Or if the user is requesting a short anwser please just anwser the question instead of generating a formal report."
 
     system_message = SystemMessage(content=system_prompt)
     converted_messages = []

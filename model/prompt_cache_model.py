@@ -5,6 +5,7 @@ from collections import defaultdict
 class Prompt(BaseModel):
     type: str
     content: str
+    file_names: list[str]
 
 class PromptCacheInMemory:
     def __init__(self):

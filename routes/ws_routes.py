@@ -13,7 +13,7 @@ load_dotenv()
 ws_router = APIRouter()
 
 
-async def run_workflow_with_generator(thread_id: str, user_message: str):
+async def run_workflow_with_generator(thread_id: str, user_message: str, file_names: list[str]):
     """运行带 yield 的工作流"""
     
     print(f"🚀 开始工作流: {thread_id} - {user_message}")
@@ -24,7 +24,7 @@ async def run_workflow_with_generator(thread_id: str, user_message: str):
         #     # 实时发送每个事件到前端
         #     await manager.send_event(thread_id, event)
         #     print(f"📨 发送事件: {event['type']}")
-        await invoke(user_input=user_message, thread_id=thread_id)
+        await invoke(user_input=user_message, thread_id=thread_id, file_names=file_names)
              
     except Exception as e:
         # 🎯 错误处理
@@ -50,24 +50,27 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
             data = await websocket.receive_text()
             message_data = json.loads(data)
             print(f"received prompt: {message_data}")
+            user_message = message_data.get("message", None)
+            file_names = message_data.get("fileNames", [])
             
             if message_data["type"] == "start_workflow":
-                user_message = message_data["message"]
-                asyncio.create_task(run_workflow_with_generator(thread_id=thread_id, user_message=user_message))
+                # user_message = message_data["message"]
+                # file_names = message_data.get("fileNames", [])
+                asyncio.create_task(run_workflow_with_generator(thread_id=thread_id, user_message=user_message, file_names=file_names))
             elif message_data["type"] == "user_clarify_response": ##handle hard pause response
-                message_content = message_data.get("message", None)
-                if message_content == None:
+                # message_content = message_data.get("message", None)
+                if user_message == None:
                     await manager.send_event(thread_id=thread_id, event={
                         "type": "message_error",
                         "sender": "message_validator",
                         "content": "Please provide a valid content"
                     })
                 else:
-                    asyncio.create_task(run_workflow_with_generator(thread_id=thread_id, user_message=message_content))
+                    asyncio.create_task(run_workflow_with_generator(thread_id=thread_id, user_message=user_message, file_names=file_names))
             elif message_data["type"] == "user_prompt" and manager.get_session(thread_id=thread_id)["status"] == "in progress":
-                prompt_cache.session[thread_id].append({"type": "user_prompt", "message": message_data.get("message")})
+                prompt_cache.session[thread_id].append({"type": "user_prompt", "message": user_message, "file_names": file_names})
             elif message_data["type"] == "user_prompt" and manager.get_session(thread_id=thread_id)["status"] == "idle":
-                asyncio.create_task(run_workflow_with_generator(thread_id=thread_id, user_message=message_data.get("message", None)))
+                asyncio.create_task(run_workflow_with_generator(thread_id=thread_id, user_message=user_message, file_names=file_names))
 
             elif message_data["type"] == "ping":
                 await manager.send_event(thread_id=thread_id, event={"type": "pong"})

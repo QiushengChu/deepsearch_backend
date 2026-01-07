@@ -4,7 +4,7 @@ from model.session_manager import manager
 import asyncio
 from langchain_core.messages import HumanMessage
 
-async def invoke(user_input: str, thread_id: str):
+async def invoke(user_input: str, thread_id: str, file_names: list[str]) :
     config = {
         "configurable": { "thread_id": thread_id}
     }
@@ -21,7 +21,12 @@ async def invoke(user_input: str, thread_id: str):
     supervisor_app.aget_state
     await supervisor_app.ainvoke(
         {
-            "messages": [HumanMessage(content=user_input)], 
+            "messages": [HumanMessage(
+                content=user_input,
+                additional_kwargs={
+                    "file_names": file_names
+                }
+            )], 
             "sender": "user", 
             "thread_id": thread_id,
             "pause_required": False,
