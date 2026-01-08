@@ -39,7 +39,7 @@ ROUTE_JSON_SCHEMA = {
     "properties": {
         "path": {
             "type": "string",
-            "enum": ["clarify_app", "topic_summary_app", "search_app", "report_writer_app", "file_search_app"],
+            "enum": ["clarify_app", "topic_summary_app", "search_app", "report_writer_app", "file_search_app", "file_generator_app"],
             "description": "The next application/agent to route to"
         },
         "reasoning": {

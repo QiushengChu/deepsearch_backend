@@ -3,7 +3,7 @@ from model.file_parser import Chromadb_agent
 from langgraph.graph import StateGraph, START
 from typing import TypedDict, Sequence, Annotated, Literal, List
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage, SystemMessage
+from langchain_core.messages import BaseMessage, AIMessage, ToolMessage, SystemMessage
 from langgraph.types import Command
 from langchain_deepseek import ChatDeepSeek
 from langchain_core.tools import tool
@@ -124,9 +124,9 @@ async def chromadb_search(search_collection_list: List[Search_Sentence_Collectio
             type = "file search agent cannot find related information ",
             sender = "file_search_tool",
             content = "No relevant information found in the uploads",
-            input_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
-            output_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
-            total_tokens = getattr(response, "usage_metadata", {}).get("total_tokens", 0),
+            input_tokens = 0,
+            output_tokens = 0,
+            total_tokens = 0,
             timestamp = time()
         )
         return ToolMessage(

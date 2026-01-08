@@ -1,7 +1,7 @@
 import os
 import shutil
 from typing import List
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi import status, APIRouter, UploadFile, HTTPException, Depends
 from model.memory import checkpointer_manager
 from utils.helper_funcs import file_upload_handler, summary_fetcher
@@ -11,7 +11,8 @@ from model.dependency.dependencies import get_chromadb_agent_singleton, get_db
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete
 from model.sqlite import SummaryIndex
-
+import mimetypes
+from urllib.parse import quote
 
 
 session_router =  APIRouter()
@@ -58,10 +59,10 @@ async def delete_files_index_via_session(
     try:
         ##remove session from langgraph session
         result = await checkpointer_manager.remove_thread(session_id=session_id)
-        if result["result"] == False:
-            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={
-                "error": f"{session_id} is not valid"
-            })
+        # if result["result"] == False:
+        #     return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={
+        #         "error": f"{session_id} is not valid"
+        #     })
 
         chromadb_agent = Chromadb_agent() #remove the collection in chromadb
         result = chromadb_agent.remove_collection_by_session_id(session_id=session_id)
@@ -79,3 +80,50 @@ async def delete_files_index_via_session(
     except Exception as e:
         raise HTTPException(state_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
+@session_router.get("/api/file/download/{session_id}/{file_name}")
+def get_file_download(session_id: str, file_name: str):
+    download_path = f"uploads/{session_id}/{file_name}"
+    try:
+        if not os.path.exists(download_path):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{file_name} does not exist")
+        if not os.path.isfile(download_path):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{file_name} is not a valid file")
+        
+        mime_type, _ = mimetypes.guess_type(download_path)
+        if mime_type is None:
+            mime_type = "application/octet-stream"
+        
+        viewable_types = [
+            'application/pdf',
+            'text/plain',
+            'text/csv',
+            'application/json',
+            'text/html',
+            'text/xml'
+        ]
+        
+        image_types = [
+            'image/jpeg', 'image/jpg', 'image/png', 
+            'image/gif', 'image/svg+xml', 'image/webp'
+        ]
+        
+        viewable_types.extend(image_types)
+
+        if mime_type in viewable_types:
+            disposition = f"inline; filename=\"{quote(file_name)}\""
+        else:
+            disposition = f"attachment; filename=\"{quote(file_name)}\""
+
+        return FileResponse(
+            path=download_path,
+            filename=file_name,
+            media_type=mime_type,
+            headers={
+                "Content-Disposition": disposition
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
+    

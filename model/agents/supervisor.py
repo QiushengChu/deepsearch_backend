@@ -20,6 +20,7 @@ from model.agents.topic_summary_app import topic_summary_app
 from model.agents.search_app import search_app
 from model.agents.report_writer_app import report_writer_app
 from model.agents.file_search_app import file_search_app
+from model.agents.file_generator_app import file_generator_app
 
 
 
@@ -36,7 +37,7 @@ class Supervisor_State(TypedDict):
 supervisor_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"), top_p=0.1, temperature=0).with_structured_output(ROUTE_JSON_SCHEMA)
 #supervisor_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0).with_structured_output(Route)
 
-async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Literal["clarify_app", "topic_summary_app", "search_app", "report_writer_app", "__end__"]]:
+async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Literal["clarify_app", "topic_summary_app", "search_app", "report_writer_app", "file_generator_app", "__end__"]]:
     '''
     supervise agent is for routing the message states between different sub-agents for completing the deligated tasks.
     '''
@@ -48,7 +49,8 @@ async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Litera
     - sender == "file_search_agent" -> 
     - sender == "clarify_agent" → Route to "topic_summary_app" (ONLY when the conversation is complex you need to break the conversation into a few topics)
     - sender == "topic_summary_agent" → Route to "search_app"
-    - sender == "search_agent" → Route to "report_writer_app"             
+    - sender == "search_agent" → Route to "report_writer_app"
+    - sender == "file_generator_agent" → Route to "file_generator_app"     
     
     Sub-agent targets:
     "clarify_agent": if user's request is not clear enough to do the search, clarify agent will be used to clarify research detail with user
@@ -56,6 +58,7 @@ async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Litera
     "search_agent": "based on search topics, using associated search tool for finding relevant information"
     "report_writer_agent": summarize all the important details with some valid assumption and to write a report or generate a quick answer
     "file_search_agent": if user has file uploaded, there might be relevant content to use
+    "file_generator_app": if user has uploaded file and update the file according to user's prompt. Notice file_generator_app includes content read and extraction function and also file generator function.
 
     This is a research question. Please be CRITICAL. Route to "clarify_app" to start the workflow if the question is not clear otherwise you can use search tool to gather real information from the true source.
     If you think based on the current conversation, the information is sufficient to anwser users' question, you can route to report_writer_agent to answer. 
@@ -174,6 +177,7 @@ async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Litera
                     "created_at": asyncio.get_event_loop().time(),
                     "message_count": len(state["messages"])
                 })
+
             return Command(goto=response['path'], update={
                 "messages": state["messages"] + [AIMessage(content=str(response), additional_kwargs={
                     "message_user": True,
@@ -232,11 +236,15 @@ supervisor_app_graph.add_node("topic_summary_app", topic_summary_app)
 supervisor_app_graph.add_node("search_app", search_app)
 supervisor_app_graph.add_node("report_writer_app", report_writer_app)
 supervisor_app_graph.add_node("file_search_app", file_search_app)
+supervisor_app_graph.add_node("file_generator_app", file_generator_app)
 supervisor_app_graph.add_edge(START, "supervisor_agent")
 supervisor_app_graph.add_edge("clarify_app", "supervisor_agent")
 supervisor_app_graph.add_edge("topic_summary_app", "supervisor_agent")
 supervisor_app_graph.add_edge("search_app", "supervisor_agent")
 supervisor_app_graph.add_edge("report_writer_app", "supervisor_agent")
 supervisor_app_graph.add_edge("file_search_app", "supervisor_agent")
+supervisor_app_graph.add_edge("file_generator_app", "supervisor_agent")
+
+
 
 supervisor_app = supervisor_app_graph.compile(checkpointer=memory.checkpointer_manager.initialize())

@@ -11,16 +11,25 @@ from model.sqlite import SummaryIndex, AsyncSessionLocal
 from sqlalchemy import delete, and_, select
 from datetime import datetime
 import logging
+from pathlib import Path
 
 
-async def extract_content(file: UploadFile)->str:
+async def extract_content(file: UploadFile = None, file_path: Path = None)->str:
     logging.getLogger("pdfminer").setLevel(logging.ERROR)
-    await file.seek(0) ##reset file reader position to 0
-    content = await file.read()
-    pdf_bytes = BytesIO(content)
+    if file and not file.filename.endswith(".pdf"):
+        return f"Currently extract content tool is not support {file.filename.split('.')[-1]} format"
+    if file_path and not str(file_path).endswith(".pdf"):
+        return f"Currently extract content tool is not support {file.filename.split('.')[-1]} format"
+    
+    if file: ##if this is a File type object
+        await file.seek(0) ##reset file reader position to 0
+        content = await file.read()
+        file_obj = BytesIO(content)
+    elif file_path: ##if it is path
+        file_obj = file_path
     text = ""
     ##extract the text and chunk
-    with pdfplumber.open(pdf_bytes) as pdf:
+    with pdfplumber.open(file_obj) as pdf:
         for idx, page in enumerate(pdf.pages):
             try:
                 page_text = page.extract_text()
