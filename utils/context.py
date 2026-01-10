@@ -41,7 +41,7 @@ def prompt_fetcher_from_cache(thread_id: str)->list[HumanMessage]:
         human_message_list = [HumanMessage(
             content=each['message'],
             additional_kwargs={
-                "file_names": each.file_names
+                "file_names": each.get("file_names", [])
             }
         ) for each in prompt_list]
         return human_message_list

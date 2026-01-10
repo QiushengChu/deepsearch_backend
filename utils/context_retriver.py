@@ -30,7 +30,7 @@ async def context_retriveral(thread_id: str):
             elif message.type == "ai" and message.additional_kwargs["message_user"]:
                 await manager.send_event(thread_id=thread_id, event=message.additional_kwargs["message_event"])
             elif message.type == "tool":
-                await manager.send_event(thread_id=thread_id, event=message.additional_kwargs["message_event"])
+                await manager.send_event(thread_id=thread_id, event=message.additional_kwargs)
     return 
         
                 

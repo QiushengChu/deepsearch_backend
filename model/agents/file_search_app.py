@@ -154,7 +154,8 @@ async def file_search_agent(state: File_Search_State)->Command[Literal["__end__"
     event = message_event.Event(
         type = "file_search_agent",
         sender = "file_search_agent",
-        content = "Enough Infomration Found.." if not response.tool_calls else "Sending to file search tool for getting more information",
+        #content = "Enough Infomration Found.." if not response.tool_calls else "Sending to file search tool for getting more information",
+        content = "Enough Infomration Found.." if not response.tool_calls else response.text, 
         input_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         output_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         total_tokens = getattr(response, "usage_metadata", {}).get("total_tokens", 0),

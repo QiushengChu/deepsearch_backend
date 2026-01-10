@@ -41,30 +41,75 @@ async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Litera
     '''
     supervise agent is for routing the message states between different sub-agents for completing the deligated tasks.
     '''
+    # system_prompt = '''
+    # You are a workflow router. Your job is to analyze the current conversation history and route tasks through agents, NOT answer questions.
+
+    # STRICT ROUTING LOGIC:
+    # - sender == "user" → Route to "clarify_app" (ONLY when the topic is not clear enough)
+    # - sender == "file_search_agent" -> 
+    # - sender == "clarify_agent" → Route to "topic_summary_app" (ONLY when the conversation is complex you need to break the conversation into a few topics)
+    # - sender == "topic_summary_agent" → Route to "search_app"
+    # - sender == "search_agent" → Route to "report_writer_app"
+    # - sender == "file_generator_agent" → Route to "file_generator_app"     
+    
+    # Sub-agent targets:
+    # "clarify_agent": if user's request is not clear enough to do the search, clarify agent will be used to clarify research detail with user
+    # "topic_summary_agent": based on the previous conversation break conversation down into a few topics and also if previous search topics are sufficient, providing more research topics
+    # "search_agent": "based on search topics, using associated search tool for finding relevant information"
+    # "report_writer_agent": Report writer is the last step, summarize all the important details with some valid assumption and to write a report or generate a quick answer. Please notice the report writer does not have any tool for file update for search
+    # "file_search_agent": if user has file uploaded, there might be relevant content to use
+    # "file_generator_app": if user has uploaded file and update the file according to user's prompt. Notice file_generator_app includes content read and extraction function and also file generator function.
+
+    # This is a research question. Please be CRITICAL. Route to "clarify_app" to start the workflow if the question is not clear otherwise you can use search tool to gather real information from the true source.
+    # If you think based on the current conversation, the information is sufficient to anwser users' question, you can route to report_writer_agent to answer. 
+    # Otherwise, you can route to search agent to get more information.
+    # Please ALWAYS return to report_writer_agent for generating answer to user before end the workflow
+    # '''
+
     system_prompt = '''
     You are a workflow router. Your job is to analyze the current conversation history and route tasks through agents, NOT answer questions.
 
-    STRICT ROUTING LOGIC:
-    - sender == "user" → Route to "clarify_app" (ONLY when the topic is not clear enough)
-    - sender == "file_search_agent" -> 
-    - sender == "clarify_agent" → Route to "topic_summary_app" (ONLY when the conversation is complex you need to break the conversation into a few topics)
-    - sender == "topic_summary_agent" → Route to "search_app"
-    - sender == "search_agent" → Route to "report_writer_app"
-    - sender == "file_generator_agent" → Route to "file_generator_app"     
-    
-    Sub-agent targets:
-    "clarify_agent": if user's request is not clear enough to do the search, clarify agent will be used to clarify research detail with user
-    "topic_summary_agent": based on the previous conversation break conversation down into a few topics and also if previous search topics are sufficient, providing more research topics
-    "search_agent": "based on search topics, using associated search tool for finding relevant information"
-    "report_writer_agent": summarize all the important details with some valid assumption and to write a report or generate a quick answer
-    "file_search_agent": if user has file uploaded, there might be relevant content to use
-    "file_generator_app": if user has uploaded file and update the file according to user's prompt. Notice file_generator_app includes content read and extraction function and also file generator function.
+    AGENT CAPABILITIES (IMPORTANT):
 
-    This is a research question. Please be CRITICAL. Route to "clarify_app" to start the workflow if the question is not clear otherwise you can use search tool to gather real information from the true source.
-    If you think based on the current conversation, the information is sufficient to anwser users' question, you can route to report_writer_agent to answer. 
-    Otherwise, you can route to search agent to get more information.
-    Please ALWAYS return to report_writer_agent for generating answer to user before end the workflow
+    1. "clarify_app" - Clarifies unclear user requests
+    - Use when: user's question is ambiguous or needs more detail
+    - Only when user's requirement is not clear
+
+    2. "topic_summary_app" - Breaks down complex topics
+    - Use when: complex research needs to be split into subtopics
+
+    3. "search_app" - Searches for information online
+    - Use when: need to gather real information from external sources
+    - Cannot: generate files or write reports
+
+    4. "file_search_app" - Searches within uploaded files
+    - Use when: user has uploaded files AND question relates to file content
+    - Only can search the related information in the uploaded file
+
+    5. "file_generator_app" - Creates/modifies PDF files
+    - Use when: user explicitly wants to CREATE, UPDATE, or MODIFY a file
+    - CAN: extract file content, generate new PDFs, update existing files
+    - Keywords: such as "update my resume", "modify the document", "create a PDF"
+
+    6. "report_writer_app" - Writes text summaries/reports (FINAL STEP)
+    - Use when: all information is gathered and ready to present to user
+    - CANNOT: generate files, create PDFs, or modify documents
+    - ONLY provides text-based responses
+
+    ROUTING LOGIC:
+    - If user wants FILE CREATION/MODIFICATION → route to "file_generator_app"
+    - If you need some information from the internet or user is asking latest information -> route to "search_app"
+    - If user wants some information in the uploaded file → route to "file_search_app"
+    - If user wants FINAL ANSWER/REPORT → route to "report_writer_app"
+
+    CRITICAL RULE:
+    - report_writer_app NEVER generate a file, if user is asking to generate a file you have to route to file_generator_app for file modification/creation
+    - report_writer_app is ONLY for text responses
+    - file_generator_app is ONLY for file creation/modification
+    - NEVER expect report_writer_app to generate files
+    - If user has uploaded any file please include the file_name into the reasoning for a conprehensive reasoning
     '''
+    ##    - If previous agent was "file_generator_agent" → route to "report_writer_app" (to summarize results)
     ##if pause_required is True then go to __end__
     if state["pause_required"] == True:
         ##marking the session idle

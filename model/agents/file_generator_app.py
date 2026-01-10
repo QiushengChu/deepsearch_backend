@@ -13,8 +13,10 @@ import os, copy
 from time import time
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from weasyprint import HTML, CSS
 from utils.context import context_purifier
+from model.session_manager import manager
 
 
 class File_Generator_State(TypedDict):
@@ -30,9 +32,13 @@ class Pdf_Payload(BaseModel):
     html_body: str = Field(..., description="This is the HTML string format of the file content, the string MUST be working for weasyprint")
     css_styles: str = Field(..., description="THis is the CSS string format of the layout, font and other visual effect for generating the PDF, the string MUST be working for weasyprint")
 
+    def to_str(self)->str:
+        return f"html_body={str(self.html_body)}, css_styles={str(self.css_styles)}"
+
 
 #pdf_generator_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"), top_p=0.1, temperature=0).with_structured_output(Pdf_Payload)
-pdf_generator_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0).with_structured_output(Pdf_Payload)
+#pdf_generator_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0).with_structured_output(Pdf_Payload)
+pdf_generator_model = ChatAnthropic(model="claude-haiku-4-5-20251001", api_key=os.getenv("claude_api_key")).with_structured_output(Pdf_Payload)
 
 
 @tool
@@ -43,17 +49,43 @@ async def pdf_generator(
         thread_id: Annotated[str, InjectedState("thread_id")]
     ) -> ToolMessage:
     '''
-    pdf_generator will take and summarize user's prompt and conversation to make two variables and make an corresponding pdf.
+    pdf_generator creates a PDF based on user's requirements and conversation context.
     Args: 
-    file_name: the file name of the updated pdf
-    internal_messages: it is injected automatically
+        file_name(str): the file name of the updated pdf
     '''
+
     system_prompt = '''
-    Please generate two variables according to the file update requirements. The two variables MUST be working with weasyprint as weasyprint is the PDF generator function
-    1. html_body(str): it is a string formated of HTML file content   
-    2. css_styles(str): it is a string formated css for beatifying the pdf content
-    Example:
-    html_body = <div class="contact-info"><div class="contact-item"><span class="icon">📱</span> Mobile: [Your Mobile]</div><div class="contact-item"><span class="icon">✉️</span> Email: xxx@com</div></div>
+    you are a PDF generator using WeasyPrint.
+
+    TASK: Generate two variables based on the user's requirements:
+    1. `html_body` (str): HTML content for the document
+    2. `css_styles` (str): CSS styling for professional appearance
+
+    ⚠️ CRITICAL RULES:
+
+    **CONTENT:**
+    - Follow the user's requirements exactly
+    - If updating an existing document, preserve ALL original content unless user explicitly asks to remove something
+    - Please Analyze the file content with advice from Tool calling agent
+    - Do NOT BLINDLY add or remove any information unless you think it is necessary to make the new pdf file be more tasking responding to user's original ask
+
+    **WEASYPRINT COMPATIBILITY:**
+    - MUST include: @page { size: A4; margin: 15mm; }
+    - AVOID: flexbox gap, CSS grid, calc(), modern CSS
+    - USE: floats, inline-block, fixed widths (px or %)
+    - ADD: page-break-inside: avoid; for sections
+
+    **QUALITY:**
+    - Clean, professional appearance
+    - Readable fonts (Arial, sans-serif, 10-12pt)
+    - Clear visual hierarchy
+    - Consistent spacing
+
+    **HTML STRUCTURE:**
+    ```html
+    <div class="container">
+        <!-- Your content here based on user requirements -->
+    </div>
     css-styles = .resume-container { background-color: white; box-shadow: 0 0 15px rgba(0, 0, 0, 0.1); border-radius: 8px; overflow: hidden; padding: 20px;}
     '''
     
@@ -80,16 +112,25 @@ async def pdf_generator(
         input_tokens=getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         output_tokens=getattr(response, "usage_metadata", {}).get("output_tokens", 0),
         total_tokens=getattr(response, "usage_metadata", {}).get("total_tokens", 0),
-        timestamp=time()
+        timestamp=time(),
+        #fileNames=[f"http://localhost:8000/api/file/artifactory/{file_name}"]
+        fileNames=[file_name]
     )
+    # await manager.send_event(thread_id=thread_id, event = event)
+    
     return ToolMessage(
         tool_call_id=tool_call_id,
-        content=f"{file_name} has been generated into the artifactories",
+        #content=f"{file_name} has been generated successfully in artifactory. This is the file content: \n {response.html_body} and css style \n {response.css_styles}.  please analyze the next step",
+        content=f"{file_name} has been generated successfully in artifactory. Please analyze the next step",
         additional_kwargs={
             "sender": "pdf_generator_tool",
             "message_user": False,
             "message_event": event.model_dump(),
-            "timestamp": time()
+            "timestamp": time(),
+            "payload": response.to_str(),  ##saving the pdf payload
+            "file_names": [file_name],
+            # "file_content": response.html_body
+            # "file_names": [f"http://localhost:8000/api/file/artifactory/{file_name}"]
         }
     )
 
@@ -97,6 +138,7 @@ async def pdf_generator(
 @tool
 async def content_extractor(
         file_name: str, 
+        uploaded_by_user: bool,
         thread_id: Annotated[str, InjectedState("thread_id")],
         tool_call_id: Annotated[str, InjectedState("tool_call_id")]
     ) -> ToolMessage:
@@ -104,13 +146,14 @@ async def content_extractor(
     This content extractor is extracting content from the targeted files and return a plain string as content
     Args:
         file_name(str): the name of file for content extraction
+        uploaded_by_user(bool): if the file is uploaded by the user then True; if generated by file_generator_agent then False
         thread_id(str): The current session ID (automatically injected)
         tool_call_id(str): The tool call id (automatically injected)
     
     Returns:
         String formate result of the content from the target file 
     '''
-    file_path = Path(f"uploads/{thread_id}/{file_name}")
+    file_path = Path(f"uploads/{thread_id}/{file_name}") if uploaded_by_user else Path(f"artifactories/{thread_id}/{file_name}")
     content = await extract_content(file_path=file_path)
     event = message_event.Event(
         type=f"extracting content from {file_name}",
@@ -148,15 +191,22 @@ async def file_generator_agent(state: File_Generator_State) -> Command:
     Tools: pdf_generator, content_extractor
     """
 
-    system_prompt = """You are a file generator agent that updates uploaded documents based on user requests.
+    system_prompt = """You are a critical-thinking document editor.
     Your workflow:
     1. Extract current file content using content_extractor
     2. Analyze user's modification requirements
     3. Generate updated document using pdf_generator
 
-    Key principles:
-    - Always read existing content before modifying
-    - Maintain document quality and professional appearance  
+    Tools:
+    content_extractor: if user is asking for some information in uploaded files or generated file in artifactory, for getting the content of those, you can call content extractor.
+    pdf_generator: if user is asking to create a PDF you can you this tool for creating pdf payload and generator the pdf file by giving it advice on pdf content
+
+    BEFORE GENERATING, CONSIDER:
+    - What does the user want vs. what would actually help them?
+    - What are the document's weaknesses I can fix?
+    - How can I add value beyond the minimum request?
+
+    Don't just execute blindly. Think critically, then generate a quality result.
 
     You modify existing files, not create new ones. Respect the original document's purpose while incorporating requested updates.
     """
@@ -186,7 +236,9 @@ async def file_generator_agent(state: File_Generator_State) -> Command:
                 "sender": "file_generator_agent",
                 "message_user": True,
                 "message_event": event.model_dump(),
-                "timestamp": time()
+                "timestamp": time(),
+                "payload": last_message.additional_kwargs.get("payload", "No payload generated"),
+                "file_names": last_message.additional_kwargs.get("file_names", [])
             }
         )
         
@@ -227,9 +279,11 @@ async def file_generator_agent(state: File_Generator_State) -> Command:
         return Command(
             goto="tools",
             update={
-                # "messages": [response],  # Add to parent messages
-                "messages": state["messages"],  # Add to parent messages
-                "internal_messages": [response],  # Add to internal messages  
+                #"messages": [response],  # Add to parent messages
+                "messages": state["messages"] + [AIMessage(content=response.content, additional_kwargs={
+                    "message_user": False
+                })],  # Add to parent messages with the updating or creation opinion
+                "internal_messages": state["messages"] + [response],  # Add to internal messages  
                 "sender": "file_generator_agent",
                 "tool_call_id": response.tool_calls[0]['id']
             }

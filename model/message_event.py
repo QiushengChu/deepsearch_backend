@@ -10,3 +10,4 @@ class Event(BaseModel):
     total_tokens: int
     links: Optional[List[str]] = None
     timestamp: float
+    fileNames: Optional[List[str]] = None
