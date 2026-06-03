@@ -21,6 +21,7 @@ from model.agents.search_app import search_app
 from model.agents.report_writer_app import report_writer_app
 from model.agents.file_search_app import file_search_app
 from model.agents.file_generator_app import file_generator_app
+from model.agents.coding_app import coding_app
 
 
 
@@ -37,35 +38,10 @@ class Supervisor_State(TypedDict):
 supervisor_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"), top_p=0.1, temperature=0).with_structured_output(ROUTE_JSON_SCHEMA)
 #supervisor_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0).with_structured_output(Route)
 
-async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Literal["clarify_app", "topic_summary_app", "search_app", "report_writer_app", "file_generator_app", "__end__"]]:
+async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Literal["clarify_app", "topic_summary_app", "search_app", "report_writer_app", "coding_app", "__end__"]]:
     '''
     supervise agent is for routing the message states between different sub-agents for completing the deligated tasks.
     '''
-    # system_prompt = '''
-    # You are a workflow router. Your job is to analyze the current conversation history and route tasks through agents, NOT answer questions.
-
-    # STRICT ROUTING LOGIC:
-    # - sender == "user" → Route to "clarify_app" (ONLY when the topic is not clear enough)
-    # - sender == "file_search_agent" -> 
-    # - sender == "clarify_agent" → Route to "topic_summary_app" (ONLY when the conversation is complex you need to break the conversation into a few topics)
-    # - sender == "topic_summary_agent" → Route to "search_app"
-    # - sender == "search_agent" → Route to "report_writer_app"
-    # - sender == "file_generator_agent" → Route to "file_generator_app"     
-    
-    # Sub-agent targets:
-    # "clarify_agent": if user's request is not clear enough to do the search, clarify agent will be used to clarify research detail with user
-    # "topic_summary_agent": based on the previous conversation break conversation down into a few topics and also if previous search topics are sufficient, providing more research topics
-    # "search_agent": "based on search topics, using associated search tool for finding relevant information"
-    # "report_writer_agent": Report writer is the last step, summarize all the important details with some valid assumption and to write a report or generate a quick answer. Please notice the report writer does not have any tool for file update for search
-    # "file_search_agent": if user has file uploaded, there might be relevant content to use
-    # "file_generator_app": if user has uploaded file and update the file according to user's prompt. Notice file_generator_app includes content read and extraction function and also file generator function.
-
-    # This is a research question. Please be CRITICAL. Route to "clarify_app" to start the workflow if the question is not clear otherwise you can use search tool to gather real information from the true source.
-    # If you think based on the current conversation, the information is sufficient to anwser users' question, you can route to report_writer_agent to answer. 
-    # Otherwise, you can route to search agent to get more information.
-    # Please ALWAYS return to report_writer_agent for generating answer to user before end the workflow
-    # '''
-
     system_prompt = '''
     You are a workflow router. Your job is to analyze the current conversation history and route tasks through agents, NOT answer questions.
 
@@ -86,10 +62,8 @@ async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Litera
     - Use when: user has uploaded files AND question relates to file content
     - Only can search the related information in the uploaded file
 
-    5. "file_generator_app" - Creates/modifies PDF files
-    - Use when: user explicitly wants to CREATE, UPDATE, or MODIFY a file
-    - CAN: extract file content, generate new PDFs, update existing files
-    - Keywords: such as "update my resume", "modify the document", "create a PDF"
+    5. "coding_app" - Writing code to solve generic problem user asked
+    - Use when: User asking for complete the task which can be solved by writing code
 
     6. "report_writer_app" - Writes text summaries/reports (FINAL STEP)
     - Use when: all information is gathered and ready to present to user
@@ -97,15 +71,13 @@ async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Litera
     - ONLY provides text-based responses
 
     ROUTING LOGIC:
-    - If user wants FILE CREATION/MODIFICATION → route to "file_generator_app"
+    - If the problem can be solved by coding -> route to "coding_app"
     - If you need some information from the internet or user is asking latest information -> route to "search_app"
     - If user wants some information in the uploaded file → route to "file_search_app"
     - If user wants FINAL ANSWER/REPORT → route to "report_writer_app"
 
     CRITICAL RULE:
-    - report_writer_app NEVER generate a file, if user is asking to generate a file you have to route to file_generator_app for file modification/creation
     - report_writer_app is ONLY for text responses
-    - file_generator_app is ONLY for file creation/modification
     - NEVER expect report_writer_app to generate files
     - If user has uploaded any file please include the file_name into the reasoning for a conprehensive reasoning
     '''
@@ -145,40 +117,6 @@ async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Litera
 
     ##human intervention in case dead loop between supervisor and topic_summary_agent
     if user_prompt_list == []:
-        # if state["sender"] == "clarify_agent":
-        #     return Command(goto="topic_summary_app", update={
-        #         "messages": state["messages"], 
-        #         "sender": "supervisor_agent",
-        #         "thread_id": state["thread_id"],
-        #         "pause_required": False
-        #     })
-        # elif state["sender"] == "topic_summary_agent":
-        #     return Command(goto="search_app", update={
-        #         "messages": state["messages"], 
-        #         "sender": "supervisor_agent",
-        #         "thread_id": state["thread_id"],
-        #         "pause_required": False
-        #     })
-        # elif state["sender"] == "search_agent":
-        #     return Command(goto="report_writer_app", update={
-        #         "messages": state["messages"],
-        #         "sender": "supervisor_agent",
-        #         "thread_id": state["thread_id"],
-        #         "pause_required": False
-        #     })
-        # elif state["sender"] == "report_writer_agent":
-        #     manager.update_session(thread_id=state["thread_id"], updates={
-        #         "status": "idle",
-        #         "current_step": "waiting user response",
-        #         "created_at": asyncio.get_event_loop().time(),
-        #         "message_count": len(state["messages"])
-        #     })
-        #     return Command(goto="__end__", update={
-        #         "messages": state["messages"],
-        #         "sender": "supervisor_agent",
-        #         "thread_id": state["thread_id"],
-        #         "pause_required": False
-        #     })
         if state["sender"] == "report_writer_agent":
             manager.update_session(thread_id=state["thread_id"], updates={
                 "status": "idle",
@@ -281,14 +219,16 @@ supervisor_app_graph.add_node("topic_summary_app", topic_summary_app)
 supervisor_app_graph.add_node("search_app", search_app)
 supervisor_app_graph.add_node("report_writer_app", report_writer_app)
 supervisor_app_graph.add_node("file_search_app", file_search_app)
-supervisor_app_graph.add_node("file_generator_app", file_generator_app)
+# supervisor_app_graph.add_node("file_generator_app", file_generator_app)
+supervisor_app_graph.add_node("coding_app", coding_app)
 supervisor_app_graph.add_edge(START, "supervisor_agent")
 supervisor_app_graph.add_edge("clarify_app", "supervisor_agent")
 supervisor_app_graph.add_edge("topic_summary_app", "supervisor_agent")
 supervisor_app_graph.add_edge("search_app", "supervisor_agent")
 supervisor_app_graph.add_edge("report_writer_app", "supervisor_agent")
 supervisor_app_graph.add_edge("file_search_app", "supervisor_agent")
-supervisor_app_graph.add_edge("file_generator_app", "supervisor_agent")
+# supervisor_app_graph.add_edge("file_generator_app", "supervisor_agent")
+supervisor_app_graph.add_edge("coding_app", "supervisor_agent")
 
 
 

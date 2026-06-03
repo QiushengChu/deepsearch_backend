@@ -1,505 +1,323 @@
+from typing import Annotated, TypedDict, Literal
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langgraph.graph.message import add_messages
+from langgraph.graph import START, StateGraph
+from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+from langgraph.types import Command
+from pydantic import BaseModel, Field
+from langchain.tools import tool
+from langgraph.prebuilt import ToolNode
+import subprocess
+import docker
+from docker.errors import ContainerError, ImageNotFound, APIError
+import os
+
+load_dotenv()
+
+class AgentForward(BaseModel):
+    agent_name: Literal["__end__", "code_planner"] = Field(..., description="The next agent name it can be either __end__ or code_runner")
+    reason: str = Field(..., description="the reason of next message forward to the agent")
+
+    @staticmethod
+    def to_str(agent_forward: "AgentForward")->str:
+        return f"agent_name: {agent_forward.agent_name}, reason: {agent_forward.reason}"
+
+class Plans(BaseModel):
+    todo_md: str = Field(..., description="The content for the todo.md file where each task and its progress is explicitly defined.")
+    plans: list[str] = Field(..., description="The string list of REMAINING tasks EXCLUDE COMPLETED ones")
+
+class Code(BaseModel):
+    code_text: str = Field(..., description="The python code in string")
+    file_name: str = Field(..., description="The file name of the code")   
+
+class CodeList(BaseModel):
+    code_list: list[Code] = Field(..., description="The list of Code obect. Each of them contains code an file_name of the code") 
+    exe_cmd: list[str] = Field(..., description="The list of cmd executions, Notice, python is the runtime exe")
+
+class Problem(BaseModel):
+    MAX_RETRIES: int = Field(default=5, description="Maximum number of retries")
+    stratch_notepad: str = Field(..., description="Error description of the problem")
+    code_fix: CodeList | None = Field(default=None, description="Code fix of the problem")
+    
+
+class StateMessage(TypedDict):
+    messages: Annotated[BaseMessage, add_messages]
+    sub_tasks: list[str] ### task list 
+    initial_code: CodeList ### initial code solution
+    problems: list[Problem] ## after initial code execution, the array for storing error and corresponding bug fix
 
 
-# from typing_extensions import TypedDict
-# from langgraph.graph.state import StateGraph, START
-# from typing_extensions import TypedDict
-# from langgraph.graph.state import StateGraph, START
-# from typing import Annotated, Sequence
-# from langgraph.graph.message import add_messages
+supervisor_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key")).with_structured_output(AgentForward)
+#supervisor_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key")).with_structured_output(AgentForward)
 
-# # Define subgraph
-# class SubgraphState(TypedDict):
-#     # note that none of these keys are shared with the parent graph state
-#     bar: Annotated[Sequence[str], add_messages] ##take parent messages and pass back to parent
-#     baz: Annotated[Sequence[str], add_messages] ##subagent internal messages
-
-# def subgraph_node_1(state: SubgraphState):
-#     return {
-#         "bar": state["bar"],
-#         "baz": state["bar"] + ["Hello this is subnode 1, should be ignored"]
-#     }
-
-# def subgraph_node_2(state: SubgraphState):
-#     return {
-#         "bar": state["bar"] + ["Hello this is subnode 2"]
-#     }
-
-# subgraph_builder = StateGraph(SubgraphState)
-# subgraph_builder.add_node(subgraph_node_1)
-# subgraph_builder.add_node(subgraph_node_2)
-# subgraph_builder.add_edge(START, "subgraph_node_1")
-# subgraph_builder.add_edge("subgraph_node_1", "subgraph_node_2")
-# subgraph = subgraph_builder.compile()
-
-# # Define parent graph
-# class ParentState(TypedDict):
-#     foo: Annotated[Sequence[str], add_messages]
-
-# def node_1(state: ParentState):
-#     return {
-#         "foo": state["foo"] + ["hello, this is parentnode 1"]
-#     }
-
-# def node_2(state: ParentState):
-#     # Transform the state to the subgraph state
-#     response = subgraph.invoke({"bar": state["foo"], "baz": []})
-#     # Transform response back to the parent state
-#     return {"foo": response["bar"]}
-
-
-# builder = StateGraph(ParentState)
-# builder.add_node("node_1", node_1)
-# builder.add_node("node_2", node_2)
-# builder.add_edge(START, "node_1")
-# builder.add_edge("node_1", "node_2")
-# graph = builder.compile()
-
-# for chunk in graph.stream({"foo": "foo"}, subgraphs=False):
-#     print(chunk)
-
-from weasyprint import HTML, CSS
-
-def generate_polished_pdf(html_body, css_styles, output_path="output.pdf"):
-    full_html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head><meta charset="UTF-8"></head>
-    <body>{html_body}</body>
-    </html>
-    """
-    HTML(string=full_html).write_pdf(
-        output_path,
-        stylesheets=[CSS(string=css_styles)]
+def supervisor_node(state: StateMessage)->Command[Literal["__end__", "code_planner"]]:
+    response = supervisor_model.invoke(state["messages"])
+    print(f"The reason of the next forward: {response.reason}")
+    return Command(
+        goto=response.agent_name,
+        update={
+            **state,
+            "messages": state["messages"] + [AIMessage(content=AgentForward.to_str(response))],
+            "sub_tasks": [],
+            "initial_code": None,
+            "problems": []
+        }
     )
 
-html_body = """
-<div class="resume-container">
-    <div class="accent-line"></div>
+
+code_planner_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key")).with_structured_output(Plans)
+#code_planner_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key")).with_structured_output(Plans)
+
+def code_planner_node(state: StateMessage)->Command[Literal["code_generator"]]:
+    system_prompt = """You are a master project planner for a team of AI coding agents. Your sole responsibility is to take a user's request and create a step-by-step plan in markdown format and subtasks string list. You do **not** write code.
+    **Your Workflow:**
+
+    1.  **Analyze the Goal:** Carefully read the user's request and the conversation history to understand the ultimate objective.
+    2.  **Formulate a Strategy:** Think about the logical sequence of steps required to achieve the goal.
+    3.  **Decompose into Sub-tasks:** Break down your strategy into a list of small, specific, and sequential sub-tasks.
+
+    **Rules for Creating Sub-tasks:**
+    *   **Granularity:** Each sub-task must be a single, simple action.
+        *   *Bad:* "Process the PDF and extract emails."
+        *   *Good:* 1. "Read the text content from the PDF file 'document.pdf'." 2. "Analyze the extracted text to find all email addresses using regex."
+    *   **Assume No Context:** The coding agent is stateless. The first sub-task should almost always be to explore the environment (e.g., "List all files in the current directory").
+    *   **Be Explicit:** Clearly mention file names or other specific details if they are known.
+
+    **Output Format:**
+    Your final output **must** be a markdown-formatted checklist. Start with the header `# Project Plan` and list each sub-task as a checklist item `- [ ]`.
+
+    **Example Output:**
+    ```markdown
+    # Project Plan
+
+    - [ ] Step 1: List all files in the current directory.
+    - [ ] Step 2: Read the content of the PDF file 'document.pdf'.
+    - [ ] Step 3: Analyze the extracted text to find all email addresses using a regular expression.
+    - [ ] Step 4: Save the found email addresses to a new file named 'emails.txt'.
+    """
+    system_message = SystemMessage(content=system_prompt)
+    response = code_planner_model.invoke(state["messages"] + [system_message])
+    ###saving response into todo.md
+    with open("./session_123/todo.md", "w") as f:
+        f.write(response.todo_md)
+    print(f"code planner has saved the plannings into todo.md")
+    return Command(
+        goto="code_generator",
+        update={
+            **state,
+            "messages": state["messages"] + [AIMessage(content=f"{response.todo_md}")],
+            "sub_tasks": response.plans
+        }
+    )
+
+
+code_generator_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key")).with_structured_output(CodeList)
+#code_generator_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key")).with_structured_output(CodeList)
+
+def code_generator_node(state: StateMessage)->Command[Literal["supervisor", "code_runner"]]:
+    if state["sub_tasks"]:
+        current_task = state["sub_tasks"][0]
+        system_prompt = f"""
+        You are a Python coding assistant. Complete the task by calling `code_runner_tool`.
+        ### 📌 Task  
+        "{current_task}"
+        ---
+        ### 🛠 Tool Parameters
+        - code_list: List of {"file_name": "...", "code_text": "..."} objects. Use [] if no files needed.  
+        - exe_cmd: List of shell commands. Runtime: python3.11  
+        ---
+        ## ⚠️ Critical Rules
+        ### 1. Exit Code Convention
+        - sys.exit(0) = Task TRULY completed with valid data  
+        - sys.exit(1) = Task failed (no data, error, empty result)  
+        ---
+        ### 2. Always validate before exit(0)
+        import sys  
+        if not data or len(data) == 0:  
+            print("ERROR: No data returned")  
+            sys.exit(1)  
+
+        print(result)  
+        sys.exit(0)  
+        ---
+
+        ## 🚨 IMPORTANT - Bug Fix Rules
+        ### ✅ MUST FOLLOW
+        - ALWAYS use the EXACT SAME filename when fixing bugs  
+        - NEVER add suffixes like _v2, _fixed, _new, _final  
+        - NEVER create new files for bug fixes  
+
+        ---
+        ### ❌ Wrong Examples
+
+        Original file: script.py  
+        - script_v2.py  
+        - script_fixed.py  
+        - fix_script.py  
+        - new_script.py  
+
+        ---
+        ### ✅ Correct Example
+        Original file: script.py  
+        - script.py (overwrite the original)  
+        ---
+        Another Example  
+        Original file: verify_ssl.py  
+        - verify_ssl_v2.py  
+        - verify_ssl_fixed.py  
+        - verify_ssl_final.py  
+        - verify_ssl.py  
+        ---
+        ## 🌐 Environment Constraints
+        ### ❌ Not Allowed
+        - No API keys available  
+        - No custom environment  
+        ### ✅ Allowed
+        - Public APIs  
+        - Local files  
+        ---
+        ## ⏱ Execution Safety
+        - All network requests MUST have timeout=10  
+        - No infinite loops  
+        - No blocking stdin  
+        ---
+        ## 🚀 Final Instruction
+        Generate code now. Remember: when fixing bugs, use the EXACT SAME filename.
+        """
+        if state["sub_tasks"]:
+            current_task = state["sub_tasks"][0]
+            print(f"current_task is {current_task}......")
+            if state["problems"]: ## if the problem exists
+                ##if there is temp message from stratch_notepad, there is execution error...Regenerating code
+                human_prompt = f"""Can you please fix the problem for completing the task {current_task} ? 
+                Here is the error history: \n 
+                initial code and exe_cmd are \n
+                    {state['initial_code'].model_dump_json()}
+                following bug fix code and execution is: \n
+                    {[ f'No{idx} cmd: {each.model_dump_json()}' for idx, each in enumerate(state['problems'])]}
+                Notice: Only print out the KEY informaiton and execution results
+                """
+                message = HumanMessage(content=human_prompt)
+            else:
+                message = HumanMessage(content=system_prompt)
+
+            response = code_generator_model.invoke(state["messages"] + [message])
+            if isinstance(response, CodeList) and (response.code_list or response.exe_cmd):
+                return Command(
+                    goto="code_runner",
+                    update={
+                        **state,
+                        "initial_code": state["initial_code"] if state["initial_code"] else response,
+                        "problems": [*state['problems'][:-1], state['problems'][-1].model_copy(update={"code_fix": response})] if state["problems"] else []
+                    }
+                )
+    return Command(
+        goto="supervisor",
+        update={
+            "messages": state["messages"] + [response]
+        }
+    )
+
+
+def update_todo_md(task: str, output: str)->Plans:
+    with open("./session_123/todo.md", "r") as f:
+        todo_md = f.read()
+    prompt = f"""
+    The task {task} has been completed. Can you update the todo.md ? Please mark the completed task with 'x',
+    Please review the todo.md and the last step output, update the following steps if necessary (There might be mistakes in the plannings)..
+    such as - [x] completed_task
+    Here is the content in the todo.md:\n
+    {todo_md}\n
+    Here is the last step output:\n
+    {output}\n
+    Notice: 
+    Please keep the completed steps the same, ONLY update on the pending tasks if required.
+    Also the task which has been completed, Please add some notice or summary for the tasks in terms of results and intermediary code and output files.
+    """
+    response = code_planner_model.invoke(prompt) ## the output is the PLAN
+    with open("./session_123/todo.md", "w") as f:
+        f.write(response.todo_md)
+    print(f"todo.md has been updated....")
+    return response
     
-    <div class="header">
-        <h1 class="name">Tim C</h1>
-        <div class="title">Senior Cybersecurity Engineer</div>
-        
-        <div class="contact-info">
-            <div class="contact-item">
-                <span class="icon">📱</span> Mobile: [Your Mobile]
-            </div>
-            <div class="contact-item">
-                <span class="icon">✉️</span> Email: xxx@com
-            </div>
-        </div>
-    </div>
-    
-    <div class="section">
-        <h2 class="section-title">About Me</h2>
-        <div class="about-me">
-            Senior cybersecurity engineer with deep expertise in application and infrastructure security, DevSecOps, cloud security, and penetration testing. With a strong full-stack and automation background, I design scalable security architectures, harden CI/CD and API ecosystems, and drive secure development across teams. I also specialize in AI-driven security engineering — building functional AI agents, fine-tuning LLMs for secure code analysis, and integrating intelligent workflows to enhance detection, analysis, and developer productivity.
-        </div>
-    </div>
-    
-    <div class="section">
-        <h2 class="section-title">Experience</h2>
-        
-        <div class="experience-item">
-            <div class="job-header">
-                <div>
-                    <div class="job-title">Senior Manager – Application Security Design Engineer</div>
-                    <div class="company">Macquarie Group - Banking and Financial Service</div>
-                </div>
-                <div class="job-period">2023 June to Now</div>
-            </div>
-            <div class="job-description">
-                <ul class="responsibilities">
-                    <li>Designed Noname API security integration architecture with compliance requirement and developing automation for automatic instance redeployment and failover.</li>
-                    <li>Executed targeted penetration testing on newly released applications and features to uncover potential security gaps.</li>
-                    <li>Developed security coding templates and fortifying CI/CD pipelines to ensure adherence to best practices.</li>
-                    <li>Designed and implemented API security solutions in Apigee API gateway according application requirement.</li>
-                    <li>Built robust Apigee gateway proxies for banking and employee applications, implementing OAuth 2.0 for enhanced authentication.</li>
-                    <li>Engineered and built a fast docker vulnerability data contextualizer to streamline the process of managing vulnerabilities.</li>
-                    <li>Engineered the implementation of GitHub Advance Security for organization code repositories.</li>
-                    <li>Supervised fine tune (SFTed) with QWen-2B and QLoar Llama2-7B with customized CodeQL rulesets for making specialized CodeQL query writers.</li>
-                </ul>
-            </div>
-        </div>
-        
-        <div class="experience-item">
-            <div class="job-header">
-                <div>
-                    <div class="job-title">Full-Stack Developer - Side Project</div>
-                </div>
-                <div class="job-period">2023 June to Now</div>
-            </div>
-            <div class="job-description">
-                <ul class="responsibilities">
-                    <li>Crafted and implemented the backend infrastructure for the Information web application using Node.js Express.</li>
-                    <li>Developed a responsive frontend interface for the web application using React.js.</li>
-                    <li>Built and secured CI/CD pipeline through GitHub workflows to automate the deployment process.</li>
-                    <li>Integrated authentication and authorization with 3rd identity provider via OAuth2.0.</li>
-                    <li>Developed a variety of data pipelines and web crawler for data searching, collection, parsing and normalization.</li>
-                    <li>Developed functional AI agents using Python FastAPI, enabling advanced response synthesis and data correlation.</li>
-                    <li>Engineered prompts and deployed multi-agent workflow for synthesising correct and related response of user's prompt.</li>
-                    <li>Built deep search AI agent via LangChain and LangGraph with async event generators, real-time user prompt correction.</li>
-                </ul>
-            </div>
-        </div>
-        
-        <div class="experience-item">
-            <div class="job-header">
-                <div>
-                    <div class="job-title">Lead Cyber Security Consultant</div>
-                    <div class="company">Wipro Shelde</div>
-                </div>
-                <div class="job-period">2022 May to 2023 May</div>
-            </div>
-            <div class="job-description">
-                <ul class="responsibilities">
-                    <li>Lead initiatives for migrating projects to AWS RDS and automating infrastructure and security baselines.</li>
-                    <li>Designed and conducted proof of concept (POC) for integrating CyberArk Export Vault Data utility with AWS EC2.</li>
-                    <li>Provided support for EY tech audits by demonstrating evidence of security controls.</li>
-                    <li>Developed plugins for CyberArk Privileged Session Manager (PSM) and Central Policy Manager (CPM).</li>
-                    <li>Designed and implemented Qualys vulnerability scanning solutions and processing report data using AWS Lambda.</li>
-                    <li>Mentored junior team members to cultivate their skills in automation tools and security best practices.</li>
-                </ul>
-            </div>
-        </div>
-        
-        <div class="experience-item">
-            <div class="job-header">
-                <div>
-                    <div class="job-title">Cloud Security Engineer</div>
-                    <div class="company">Pronto Software</div>
-                </div>
-                <div class="job-period">2018 Nov to 2022 April</div>
-            </div>
-            <div class="job-description">
-                <ul class="responsibilities">
-                    <li>Integrated and maintained Nagios as a cloud monitoring solution with emphasis on application-level checks.</li>
-                    <li>Orchestrated responses to malicious security incidents, conducting thorough incident investigations.</li>
-                    <li>Integrated VMWare LogInsight with AlienVault to automate the detection and alerting of security events.</li>
-                    <li>Managed patch solutions for both Windows and RedHat environments.</li>
-                    <li>Introduced Palo Alto Next-Generation Firewalls (NGFW) into the cloud infrastructure.</li>
-                    <li>Defined and fine-tuning Palo Alto Intrusion Prevention System (IPS) detection policies.</li>
-                    <li>Utilized containerization expertise to secure pronto ERP applications within Kubernetes clusters.</li>
-                    <li>Conducted penetration testing for newly released web applications.</li>
-                    <li>Managed vulnerability detection solutions and oversaw the remediation process.</li>
-                    <li>Designed and configured CyberArk Privileged Access Management (PAM) solutions.</li>
-                    <li>Collaborated with DevOps engineers to manage configuration management using Puppet modules.</li>
-                </ul>
-            </div>
-        </div>
-    </div>
-    
-    <div class="two-column">
-        <div class="section">
-            <h2 class="section-title">Education</h2>
-            <div class="education-item">
-                <div class="degree">Information and Network Security Master</div>
-                <div class="school">University of Wollongong</div>
-                <div class="education-period">2016-2018</div>
-            </div>
-            <div class="education-item">
-                <div class="degree">Computer Science Bachelor</div>
-                <div class="school">Shanghai Business School</div>
-                <div class="education-period">2010-2014</div>
-            </div>
-        </div>
-        
-        <div class="section">
-            <h2 class="section-title">Programming</h2>
-            <div class="skill-item">
-                <div class="skill-list">Python, Typescript, Fullstack, Bash</div>
-            </div>
-        </div>
-    </div>
-    
-    <div class="section">
-        <h2 class="section-title">Certificates</h2>
-        <div class="certificate-item">Certified Ethical Hacker V10</div>
-        <div class="certificate-item">AWS Certified Security Specialty</div>
-        <div class="certificate-item">Cisco Certified Internet Expert – Routing and Switching CCIE #41400</div>
-        <div class="certificate-item">RedHat Certified Architect - RHCA ID 140-048-935</div>
-    </div>
-    
-    <div class="accent-line" style="margin-top: 30px;"></div>
-</div>
-"""
 
-css_style = """
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}
+def code_runner_node(state: StateMessage) -> Command[Literal["code_generator"]]:
+    '''
+    This function is for saving the code into the code file and running the code in the sandbox environment
+    return result of execution
+    '''
+    code_list = state["problems"][-1].code_fix if state["problems"] else state["initial_code"]
+    try:
+        client = docker.from_env()
+        containers = client.containers.list(all=True, filters={"name": f"^session_123"})
+        for code in code_list.code_list:
+            with open(f"./session_123/{code.file_name}", "w") as f:
+                f.write(code.code_text)
+        if not containers:
+            ##if container does not exist
+            host_path = os.path.abspath("./session_123")
+            client.containers.run(
+                image="python:3.11.15-trixie",
+                name="session_123",
+                volumes={
+                    host_path: {'bind': '/usr/src/app', 'mode': 'rw'}
+                },
+                command="tail -f /dev/null",
+                detach=True
+            )
+        else:
+            ## if the container is dead
+            if containers[0].status != "running":
+                ##resume 
+                containers[0].start()
 
-body {
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    font-size: 12px;
-    line-height: 1.3; /* 减小行高节省空间 */
-    color: #333;
-    background-color: #f8f9fa;
-    padding: 15px; /* 减小内边距 */
-    max-width: 1000px;
-    margin: 0 auto;
-}
+        results = []
+        for cmd in code_list.exe_cmd:
+            exit_code, output = containers[0].exec_run(
+                cmd,
+                workdir="/usr/src/app"
+            )
+            if exit_code != 0:
+                result = f"cmd: {cmd} execution failed due to {output.decode('utf-8').strip()}"
+                return Command(
+                    goto="code_generator",
+                    update={ 
+                        **state, 
+                        "problems": [*state["problems"], Problem(MAX_RETRIES=5, stratch_notepad=result, code_fix=None)]
+                    }
+                )
+            results.append(f"The execution result of {cmd} is {output.decode('utf-8').strip()}")
 
-.resume-container {
-    background-color: white;
-    box-shadow: 0 0 15px rgba(0, 0, 0, 0.1);
-    border-radius: 8px;
-    overflow: hidden;
-    padding: 20px; /* 减小内边距 */
-}
+        ## update the todo.md after the successful execution
+        plans = update_todo_md(task=state["sub_tasks"][0], output="\n".join(results))
+        return Command(
+            goto="code_generator",
+            update={ 
+                **state, 
+                "initial_code": None, 
+                "problems": [], 
+                "sub_tasks": plans.plans,
+                "messages": state["messages"] + [AIMessage(content=code_list.model_dump_json()), HumanMessage(content="\n".join(results))]
+            }
+        )
+    except Exception as e:
+        return Command(
+            goto="code_generator",
+            update={ **state, "problems": state["problems"].append(Problem(MAX_RETRIES=5, stratch_notepad=result, code_fix=[]))}
+        )
 
-.header {
-    border-bottom: 2px solid #2c3e50;
-    padding-bottom: 15px; /* 减小内边距 */
-    margin-bottom: 15px; /* 减小外边距 */
-}
 
-.name {
-    font-size: 24px; /* 稍微减小字体大小 */
-    font-weight: 700;
-    color: #2c3e50;
-    margin-bottom: 3px;
-}
+supervisor_app_graph = StateGraph(StateMessage)
+supervisor_app_graph.add_node("supervisor", supervisor_node)
+supervisor_app_graph.add_node("code_planner", code_planner_node)
+supervisor_app_graph.add_node("code_generator", code_generator_node)
+supervisor_app_graph.add_node("code_runner", code_runner_node)
+# supervisor_app_graph.add_node("code_runner_tool", ToolNode(tools=[code_runner_tool]))
+supervisor_app_graph.add_edge(START, "supervisor")
+# supervisor_app_graph.add_edge("code_runner_tool", "code_executor")
+app = supervisor_app_graph.compile()
 
-.title {
-    font-size: 16px; /* 稍微减小字体大小 */
-    color: #3498db;
-    margin-bottom: 10px; /* 减小外边距 */
-    font-weight: 600;
-}
-
-.contact-info {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 15px; /* 减小间距 */
-    margin-bottom: 8px;
-}
-
-.contact-item {
-    display: flex;
-    align-items: center;
-    font-size: 10px; /* 减小字体大小 */
-}
-
-.contact-item .icon {
-    margin-right: 4px;
-    color: #3498db;
-}
-
-.section {
-    margin-bottom: 18px; /* 减小间距 */
-    break-inside: auto; /* 使用更现代的break-inside属性 */
-}
-
-.section-title {
-    font-size: 15px; /* 稍微减小字体大小 */
-    color: #2c3e50;
-    border-bottom: 1px solid #eee;
-    padding-bottom: 6px; /* 减小内边距 */
-    margin-bottom: 10px; /* 减小外边距 */
-    font-weight: 700;
-}
-
-.about-me {
-    background-color: #f8fafc;
-    padding: 12px; /* 减小内边距 */
-    border-left: 4px solid #3498db;
-    margin-bottom: 15px; /* 减小外边距 */
-    border-radius: 0 4px 4px 0;
-    line-height: 1.4; /* 增加可读性 */
-}
-
-.experience-item {
-    margin-bottom: 15px; /* 减小间距 */
-    break-inside: auto; /* 允许分页 */
-}
-
-.job-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    margin-bottom: 6px; /* 减小间距 */
-}
-
-.job-title {
-    font-weight: 700;
-    font-size: 13px; /* 稍微减小字体大小 */
-    color: #2c3e50;
-}
-
-.company {
-    font-weight: 600;
-    color: #555;
-    font-size: 11px; /* 稍微减小字体大小 */
-}
-
-.job-period {
-    font-weight: 600;
-    color: #3498db;
-    white-space: nowrap;
-    font-size: 11px; /* 稍微减小字体大小 */
-}
-
-.job-description {
-    margin-top: 5px; /* 减小间距 */
-}
-
-.responsibilities {
-    list-style-type: none;
-    padding-left: 0;
-}
-
-.responsibilities li {
-    position: relative;
-    padding-left: 12px; /* 减小缩进 */
-    margin-bottom: 4px; /* 减小行间距 */
-    font-size: 11px; /* 稍微减小字体大小 */
-    line-height: 1.3; /* 调整行高 */
-}
-
-.responsibilities li:before {
-    content: "•";
-    position: absolute;
-    left: 0;
-    color: #3498db;
-    font-weight: bold;
-}
-
-.two-column {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 20px; /* 减小间距 */
-    margin-top: 5px;
-}
-
-.education-item, .skill-item {
-    margin-bottom: 8px; /* 减小间距 */
-}
-
-.degree {
-    font-weight: 700;
-    color: #2c3e50;
-    font-size: 12px; /* 调整字体大小 */
-}
-
-.school {
-    font-weight: 600;
-    color: #555;
-    font-size: 11px; /* 调整字体大小 */
-}
-
-.education-period, .cert-date {
-    color: #777;
-    font-size: 10px; /* 减小字体大小 */
-}
-
-.skill-category {
-    font-weight: 700;
-    color: #2c3e50;
-    margin-bottom: 3px;
-}
-
-.skill-list {
-    color: #555;
-    font-size: 11px; /* 调整字体大小 */
-}
-
-.certificate-item {
-    margin-bottom: 6px; /* 减小间距 */
-    padding-left: 12px; /* 减小缩进 */
-    position: relative;
-    font-size: 11px; /* 调整字体大小 */
-}
-
-.certificate-item:before {
-    content: "✓";
-    position: absolute;
-    left: 0;
-    color: #27ae60;
-    font-weight: bold;
-}
-
-/* 优化分页控制 */
-@media print {
-    body {
-        padding: 5px; /* 打印时更小的内边距 */
-        background-color: white;
-        margin: 0;
-        font-size: 11px; /* 打印时更小的字体 */
-    }
-    
-    .resume-container {
-        box-shadow: none;
-        border-radius: 0;
-        padding: 15px; /* 打印时更小的内边距 */
-        margin: 0;
-    }
-    
-    /* 优化分页规则 */
-    .section {
-        break-inside: auto;
-        margin-bottom: 10px;
-    }
-    
-    /* 只在必要时避免分页 */
-    .section-title {
-        break-after: avoid;
-    }
-    
-    /* 允许经验项目在页面中间分割 */
-    .experience-item {
-        break-inside: auto;
-        page-break-inside: auto;
-    }
-    
-    /* 确保单个职责项不被分割 */
-    .responsibilities li {
-        break-inside: avoid;
-        page-break-inside: avoid;
-    }
-    
-    /* 减小打印时的所有间距 */
-    .header {
-        padding-bottom: 10px;
-        margin-bottom: 10px;
-    }
-    
-    .about-me {
-        padding: 10px;
-        margin-bottom: 12px;
-    }
-    
-    .experience-item {
-        margin-bottom: 12px;
-    }
-}
-
-.accent-line {
-    height: 3px; /* 减小高度 */
-    background: linear-gradient(90deg, #3498db, #2c3e50);
-    margin-bottom: 15px; /* 减小间距 */
-    border-radius: 2px;
-}
-
-.icon {
-    display: inline-block;
-    width: 10px; /* 减小宽度 */
-    text-align: center;
-    margin-right: 4px; /* 减小间距 */
-    font-weight: bold;
-    font-size: 10px; /* 减小字体大小 */
-}
-
-/* 为紧凑布局添加新类 */
-.compact-list {
-    margin-top: 3px;
-}
-
-.compact-list li {
-    margin-bottom: 3px;
-}
-"""
-
-generate_polished_pdf(html_body=html_body, css_styles=css_style)
+h_message = HumanMessage(content="""能帮我产生一个fastapi的代码吗？ 我需要listen在8000，用ssl进行加密通信，有一个Get /hello 然后返回hello world，代码必须能跑""")
+app.invoke({"messages": [h_message]})

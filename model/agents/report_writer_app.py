@@ -78,7 +78,7 @@ async def report_writer_agent(state: Report_Writer_State)-> Command[Literal["__e
     file_generation_prompt = "Please analyze the whole conversation and anwser if there is related file created by file_generator_app to user's requirement. If there is, return True and the file name. Otherwise return False and file name is None"
     file_check_result = await file_generation_check_model.ainvoke(state["messages"] + [SystemMessage(content=file_generation_prompt)])
     if file_check_result.related_file_generated:
-        system_prompt += f"\nIn the response, MUST include the newly created file via http://localhost:8000/api/file/artifactory/{state['thread_id']}/{file_check_result.file_name} in the way matching the user's prompt context"
+        system_prompt += f"\nIn the response, MUST include the newly created file via http://localhost:8000/api/file/coding_space/{state['thread_id']}/{file_check_result.file_name} in the way matching the user's prompt context"
 
     system_message = SystemMessage(content=system_prompt)
 

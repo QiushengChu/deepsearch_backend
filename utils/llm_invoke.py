@@ -6,7 +6,8 @@ from langchain_core.messages import HumanMessage
 
 async def invoke(user_input: str, thread_id: str, file_names: list[str]) :
     config = {
-        "configurable": { "thread_id": thread_id}
+        "configurable": { "thread_id": thread_id},
+        "recursion_limit": 100
     }
     supervisor_app = compile_supervisor_app_module.supervisor_app
     if supervisor_app is None:

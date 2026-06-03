@@ -57,6 +57,8 @@ async def delete_files_index_via_session(
         db: AsyncSession = Depends(get_db)
     )->JSONResponse:
     try:
+        if "." in session_id:
+            raise HTTPException(status_code=400, detail="Invalid session id")
         ##remove session from langgraph session
         result = await checkpointer_manager.remove_thread(session_id=session_id)
         # if result["result"] == False:
@@ -79,6 +81,11 @@ async def delete_files_index_via_session(
         delete_statement = delete(SummaryIndex).where(SummaryIndex.session_id == session_id)
         await db.execute(delete_statement)
         await db.commit()
+
+        ##remove everything inside coding space
+        if os.path.isdir("coding_space/{session_id}"):
+            shutil.rmtree("coding_space/{session_id}")
+            os.makedirs(f"coding_space/{session_id}", exist_ok=True)
 
         return JSONResponse(status_code=status.HTTP_200_OK, content=result[0])
     except Exception as e:
@@ -131,9 +138,9 @@ def get_file_download(session_id: str, file_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
     
-@session_router.get("/api/file/artifactory/{session_id}/{file_name}")
+@session_router.get("/api/file/coding_space/{session_id}/{file_name}")
 def get_file_download(session_id: str, file_name: str):
-    download_path = f"artifactories/{session_id}/{file_name}"
+    download_path = f"coding_space/{session_id}/{file_name}"
     try:
         if not os.path.exists(download_path):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{file_name} does not exist")

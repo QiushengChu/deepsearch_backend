@@ -12,7 +12,7 @@ from sqlalchemy import delete, and_, select
 from datetime import datetime
 import logging
 from pathlib import Path
-
+import docker
 
 async def extract_content(file: UploadFile = None, file_path: Path = None)->str:
     logging.getLogger("pdfminer").setLevel(logging.ERROR)
@@ -135,3 +135,45 @@ async def summary_fetcher(session_id: str)-> tuple[bool, str | None]:
             return (True, "\n".join(converted_summaries))
         else:
             return (False, None)
+        
+def run_docker_commands(thread_id: str, exe_cmds: list[str], code_files: list[dict])->tuple[bool, str]:
+    '''
+    checking if container with thread_id already running, if not run it
+    then running the commands in loop
+    '''
+    error_results = None
+    host_path = os.path.abspath(f"coding_space/{thread_id}")
+    if code_files: ##writing code into files
+        for each in code_files:
+            with open(f"{host_path}/{each.file_name}", "w") as f:
+                f.write(each.code_text)
+    results = []
+    try:
+        client = docker.from_env()
+        containers = client.containers.list(all=True, filters={"name": f"^{thread_id}"})
+        if not containers:
+            container = client.containers.run(
+                image="python:3.11.15-trixie",
+                name=thread_id,
+                volumes={
+                    host_path: {"bind": "/usr/src/app", "mode": "rw"}
+                },
+                command="tail -f /dev/null",
+                detach=True
+            )
+        else:
+            if containers[0].status != "running":
+                containers[0].start()
+            container = containers[0]
+        for cmd in exe_cmds:
+            exit_code, output = container.exec_run(cmd, workdir="/usr/src/app")
+            if exit_code != 0:
+                error_result = f"cmd: {cmd}, error: {output.decode('utf-8').strip()}, exit_code: {exit_code}"
+                return (False, ";".join(results + [error_result]))
+            results.append(f"cmd: {cmd} running successfully, output is \n{'None' if output is None else output.decode('utf-8').strip()}, exit_code: {exit_code}")
+        return (True, ";".join(results))
+    
+    except Exception as e:
+        return (False, ";".join(results + [error_result]))
+
+            
