@@ -70,8 +70,13 @@ async def delete_files_index_via_session(
         result = chromadb_agent.remove_collection_by_session_id(session_id=session_id)
 
         ##remove the directory for file uploads
-        if os.path.isdir(f"uploads/{session_id}"):
-            shutil.rmtree(f"uploads/{session_id}")
+        if os.path.exists(f"coding_space/{session_id}"):
+            for f in os.listdir(f"coding_space/{session_id}"):
+                file_path = os.path.join(f"coding_space/{session_id}", f)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
         
         ##remove the directory for artifactory download
         if os.path.isdir(f"artifactories/{session_id}"):
@@ -83,9 +88,9 @@ async def delete_files_index_via_session(
         await db.commit()
 
         ##remove everything inside coding space
-        if os.path.isdir("coding_space/{session_id}"):
-            shutil.rmtree("coding_space/{session_id}")
-            os.makedirs(f"coding_space/{session_id}", exist_ok=True)
+        # if os.path.isdir(f"coding_space/{session_id}"):
+        #     shutil.rmtree(f"coding_space/{session_id}")
+        #     os.makedirs(f"coding_space/{session_id}", exist_ok=True)
 
         return JSONResponse(status_code=status.HTTP_200_OK, content=result[0])
     except Exception as e:

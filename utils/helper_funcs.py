@@ -13,6 +13,7 @@ from datetime import datetime
 import logging
 from pathlib import Path
 import docker
+import time
 
 async def extract_content(file: UploadFile = None, file_path: Path = None)->str:
     logging.getLogger("pdfminer").setLevel(logging.ERROR)
@@ -141,7 +142,7 @@ def run_docker_commands(thread_id: str, exe_cmds: list[str], code_files: list[di
     checking if container with thread_id already running, if not run it
     then running the commands in loop
     '''
-    error_results = None
+    error_result = None
     host_path = os.path.abspath(f"coding_space/{thread_id}")
     if code_files: ##writing code into files
         for each in code_files:
@@ -161,9 +162,15 @@ def run_docker_commands(thread_id: str, exe_cmds: list[str], code_files: list[di
                 command="tail -f /dev/null",
                 detach=True
             )
+            for _ in range(10):
+                container.reload()
+                if container.status == "running":
+                    break
+                time.sleep(0.5)
         else:
             if containers[0].status != "running":
                 containers[0].start()
+                containers[0].reload()
             container = containers[0]
         for cmd in exe_cmds:
             exit_code, output = container.exec_run(cmd, workdir="/usr/src/app")

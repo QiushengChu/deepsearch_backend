@@ -20,15 +20,23 @@ class AgentForward(BaseModel):
         return f"forward to {'__end__' if agent_forward.output_obj_path or agent_forward.output_result else 'code_planner'}, reason: {agent_forward.reason}"
     
 class Plans(BaseModel):
-    todo_md: str = Field(..., description="The content for the todo.md file where each task and its progress is explicitly defined..")
-    plans: list[str] = Field(..., description="The string list of REMAINING tasks (NO COMPLETED tasks)")
+    steps: list[str] = Field(
+        ..., 
+        description="The content for the todo.md for each task and its progress is explicitly defined..", 
+        examples=[
+            "- [ ] Step 1: List all files in the current directory.",
+            "- [ ] Step 2: Read the content of the PDF file 'document.pdf'.",
+            "- [ ] Step 3: Analyze the extracted text to find all email addresses using a regular expression.",
+            "- [ ] Step 4: Save the found email addresses to a new file named 'emails.txt'."
+        ]
+    )
 
 class Todo(BaseModel):
-    todo_md: str = Field(..., description="The content for the todo.md file where each task and its progress is explicitly defined..")
+    updated_step_todo: str = Field(..., description="Summerizing the step execution after running commands and code execution including generated file, output string etc")
     
 class Code(BaseModel):
-    code_text: str | None = Field(default=None, description="The python code in string for the current task")
-    file_name: str | None = Field(default=None, description="The file name of the code")
+    code_text: str = Field(..., description="The python code in string for the current task")
+    file_name: str = Field(..., description="The file name of the code")
 
 class CodeList(BaseModel):
     code_list: list[Code] = Field(default=[], description="The list of Code object. Each of them contains code_text and file_name")
