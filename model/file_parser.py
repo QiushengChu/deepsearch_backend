@@ -24,7 +24,7 @@ class Chromadb_agent():
         )
         
     async def index_file(self, session_id: str, filename: str, text: str)->Dict[str, str]:
-        collection_name = f"{session_id}_{filename}"
+        collection_name = f"{session_id}_{filename}".replace(" ", "_")
         ##if found the same file in chromadb remove it.
         existing_collections_name =  [each.name for each in self.chromadb_client.list_collections()]
         if collection_name in existing_collections_name:

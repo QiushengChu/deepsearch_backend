@@ -8,7 +8,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 from pydantic import BaseModel, Field, ValidationError
 import os, asyncio
-from utils.helper_funcs import run_docker_commands
+from utils.helper_funcs import run_docker_commands, safely_ainvoke
 from docker.errors import ContainerError, ImageNotFound, APIError
 from model.code_app_models import AgentForward, Plans, CodeList, Problem, Todo
 
@@ -37,18 +37,29 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
     
     if state.get("coding_task_complete", False):
         system_prompt = "As the coding task completed, specify either output_obj_path or output_result for the supervisor agent to send to user.."
-        response = await agent_forward_model.ainvoke(state["internal_messages"] + [SystemMessage(content=system_prompt)])
+
+        response_tuple = await safely_ainvoke(model=agent_forward_model, message_sequence=state["internal_messages"] + [SystemMessage(content=system_prompt)])
+        if not response_tuple[0]: ## if exception 
+            return Command(
+                goto="agent_forward",
+                update={
+                    **state,
+                    "internal_messages": state["internal_messages"] +[SystemMessage(content=system_prompt)] + [HumanMessage(content=response_tuple[1])] ## attach exception message
+                }
+            )
+        response = response_tuple[1]
+        summary = response.task_complete_summary or "The coding task has been completed."
         if response.output_result:
-            response.task_complete_summary += f"\nOutput result: {response.output_result}"
+            summary += f"\nOutput result: {response.output_result}"
         if response.output_obj_path:
-            response.task_complete_summary += f"\nOutput Object Path: {response.output_obj_path}"
+            summary += f"\nOutput Object Path: {response.output_obj_path}"
         with open(f"coding_space/{state['thread_id']}/todo.md", "r") as f:
             todo_md = f.read()
         return Command(
             goto="__end__",
             update={
                 **state,
-                "messages": state["messages"] + [AIMessage(content=f"{response.task_complete_summary if response.task_complete_summary else 'The coding task has been completed.'} \n This is todo.md for reference\n {todo_md}")],
+                "messages": state["messages"] + [AIMessage(content="From coding_app: " + f"{response.task_complete_summary if response.task_complete_summary else 'The coding task has been completed.'} \n This is todo.md for reference\n {todo_md}")],
                 "sender": "coding_app"
             }
         )
@@ -63,7 +74,18 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
 
         Be specific. Do NOT generalize or paraphrase user's data - preserve the exact details provided. It will be used for the further agent to generate code.
         """
-        response = await agent_forward_model.ainvoke(state["messages"] + [SystemMessage(content=system_prompt)])
+        message_sequence = state["messages"] + [SystemMessage(content=system_prompt)]
+        response_tuple = await safely_ainvoke(model=agent_forward_model, message_sequence=message_sequence)
+        if not response_tuple[0]:##exception happen
+            return Command(
+                goto="agent_forward",
+                update={
+                    **state,
+                    "internal_messages": message_sequence + [HumanMessage(content=response_tuple[1])] ## attach exception message
+                }
+            )
+        response = response_tuple[1]
+        # response = await agent_forward_model.ainvoke(state["messages"] + [SystemMessage(content=system_prompt)])
         os.makedirs(name=f"coding_space/{state['thread_id']}", exist_ok=True)
         return Command(
             goto="code_planner",
@@ -111,8 +133,18 @@ async def code_planner_node(state: StateMessage)->Command[Literal["code_generato
     - [ ] Step 4: Save the found email addresses to a new file named 'emails.txt'.
     But make each step into a sperate string list
     """
-    response = await code_planner_model.ainvoke(state["internal_messages"] + [SystemMessage(content=system_prompt)])
-
+    message_sequence = state["internal_messages"] + [SystemMessage(content=system_prompt)]
+    response_tuple = await safely_ainvoke(model=code_planner_model, message_sequence=message_sequence)
+    # response = await code_planner_model.ainvoke(state["internal_messages"] + [SystemMessage(content=system_prompt)])
+    if not response_tuple[0]:
+        return Command(
+            goto="code_planner",
+            update={
+                **state,
+                "internal_messages": message_sequence + [HumanMessage(content=response_tuple[1])] ## attach exception message
+            }
+        )
+    response = response_tuple[1]
     with open(f"coding_space/{state['thread_id']}/todo.md", "w") as f:
         f.write("\n".join(response.steps))
     return Command(
@@ -187,29 +219,47 @@ async def code_generator_node(state: StateMessage)->Command[Literal["agent_forwa
 
         if state.get("problems", None): 
             ## initial code might be None, when pydantic validation error 
-            human_prompt = f"""Can you please fix the problem for completing the step {state['steps'][state['current_step_id']]} ? 
-            Here is the error history: \n 
-            initial code and exe_cmd are \n
-                {state['initial_code'].model_dump_json() if state.get('initial_code', None) else 'None'}
-            following bug fix code and execution is: \n
-                {[ f'No{idx} cmd: {each.model_dump_json()}' for idx, each in enumerate(state['problems'])]}
-            Notice: Only print out the KEY informaiton and execution results
+            human_prompt = f"""
+            ## 🐛 Bug Fix Request
+            ### 📌 Current Step
+            {state['steps'][int(state['current_step_id'])]}
+
+            ### 📋 Error History ({len(state['problems'])} attempt(s))
+
+            **Initial Code:**
+            {state['initial_code'].model_dump_json() if state.get('initial_code') else '⚠️ No initial code (output format error on first attempt)'}
+
+            **Bug Fix Attempts:**
+            {[ f'No{idx} cmd: {each.model_dump_json()}' for idx, each in enumerate(state['problems'])]}
+
+            ### 🔧 Fix Strategy
+            - If the fix is quite small, such as fix few lines of code, using `sed` for single-value changes only
+            - If the fix is large such as updating many lines of code, or completely rewrite the logic, rewrite the full code.
+
+            ### ✅ Instructions
+            1. Analyze the ROOT CAUSE, do not just patch symptoms
+            2. Every item in `code_list` MUST have both `file_name` AND `code_text`
+            3. Do NOT create versioned files (no script_v2.py, script_fixed.py)
+            4. Overwrite the ORIGINAL file
             """
             message = HumanMessage(content=human_prompt)
         else:
             message = HumanMessage(content=system_prompt)
-        try:
-            response = await code_generator_model.ainvoke(state["internal_messages"] + [message])
-        except ValidationError as e:
-            ##adding pydantic ValidationError as Problem
+        message_sequence = state["internal_messages"] + [message]
+        response_tuple = await safely_ainvoke(model=code_generator_model, message_sequence=message_sequence)
+        if not response_tuple[0]:
             return Command(
                 goto="code_generator",
                 update={
                     **state,
-                    "problems": [*state["problems"], Problem(stratch_notepad=str(e), code_fix=None)]
+                    "problems": [*state["problems"], Problem(stratch_notepad=str(response_tuple[1]), code_fix=None)]
                 }
             )
+        response = response_tuple[1]
         if isinstance(response, CodeList) and (response.code_list or response.exe_cmd):
+            for each_cmd in response.exe_cmd:
+                if 'sed' in each_cmd:
+                    print(each_cmd)
             return Command(
                 goto="code_runner",
                 update={
@@ -295,5 +345,3 @@ coding_app_graph.add_node("code_generator", code_generator_node)
 coding_app_graph.add_node("code_runner", code_runner_node)
 coding_app_graph.add_edge(START, "agent_forward")
 coding_app = coding_app_graph.compile()
-
-

@@ -14,33 +14,9 @@ import logging
 from pathlib import Path
 import docker
 import time
-
-async def extract_content(file: UploadFile = None, file_path: Path = None)->str:
-    logging.getLogger("pdfminer").setLevel(logging.ERROR)
-    if file and not file.filename.endswith(".pdf"):
-        return f"Currently extract content tool is not support {file.filename.split('.')[-1]} format"
-    if file_path and not str(file_path).endswith(".pdf"):
-        return f"Currently extract content tool is not support {file.filename.split('.')[-1]} format"
-    
-    if file: ##if this is a File type object
-        await file.seek(0) ##reset file reader position to 0
-        content = await file.read()
-        file_obj = BytesIO(content)
-    elif file_path: ##if it is path
-        file_obj = file_path
-    text = ""
-    ##extract the text and chunk
-    with pdfplumber.open(file_obj) as pdf:
-        for idx, page in enumerate(pdf.pages):
-            try:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-            except Exception as page_error:
-                print(f"Error extracting text from page {idx + 1}: {page_error}")
-                continue
-
-    return text
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage
+from utils.file_content_extractor import file_content_extract
 
 
 async def generate_file_summary(file_content: str )->str:
@@ -80,7 +56,8 @@ async def file_upload_revert_handler(file: File, session_id: str, chromadb_clien
 
 
 async def file_upload_handler(file: File, session_id: str, chromadb_client: Chromadb_agent)->dict[str, str|bool]:
-    file_path = os.path.join(f"uploads/{session_id}/{file.filename}")
+    file_path = Path((f"coding_space/{session_id}/{file.filename}"))
+    os.makedirs(file_path.parent, exist_ok=True)
     try:
         ##save the file into the directory
         async with aiofiles.open(file_path, "wb") as buffer:
@@ -88,37 +65,40 @@ async def file_upload_handler(file: File, session_id: str, chromadb_client: Chro
             await buffer.write(content)
 
         ##content extract
-        file_content = await extract_content(file=file)
-        ##indexing the uploads
-        await chromadb_client.index_file(session_id=session_id,  filename=file.filename, text=file_content)
-        ##generate summary and save it into sqlite
-        summary = await generate_file_summary(file_content=file_content)
+        # file_content = await extract_content(file=file)
+        file_content_result = await file_content_extract(file_path=file_path)
+        if file_content_result[0]:
+            ##indexing the uploads
+            await chromadb_client.index_file(session_id=session_id,  filename=file.filename, text=file_content_result[1])
+            ##generate summary and save it into sqlite
+            summary = await generate_file_summary(file_content=file_content_result[1])
 
-
-        ##each corutines must use a different db session
-        async with AsyncSessionLocal() as db:
-            ##upsert ops the summary index record
-            result = await db.execute(
-                select(SummaryIndex).where(
-                    and_(
-                        SummaryIndex.session_id == session_id,
-                        SummaryIndex.file_name == file.filename
+            ##each corutines must use a different db session
+            async with AsyncSessionLocal() as db:
+                ##upsert ops the summary index record
+                result = await db.execute(
+                    select(SummaryIndex).where(
+                        and_(
+                            SummaryIndex.session_id == session_id,
+                            SummaryIndex.file_name == file.filename
+                        )
                     )
                 )
-            )
-            existing_summary = result.scalar_one_or_none()
-            if existing_summary:
-                existing_summary.summary = summary
-                existing_summary.updated_at = datetime.now()
-            else:
-                new_summary = SummaryIndex(
-                    session_id=session_id,
-                    file_name=file.filename,
-                    summary=summary,
-                    updated_at=datetime.now()
-                )
-                db.add(new_summary)
-            await db.commit()
+                existing_summary = result.scalar_one_or_none()
+                if existing_summary:
+                    existing_summary.summary = summary
+                    existing_summary.updated_at = datetime.now()
+                else:
+                    new_summary = SummaryIndex(
+                        session_id=session_id,
+                        file_name=file.filename,
+                        summary=summary,
+                        updated_at=datetime.now()
+                    )
+                    db.add(new_summary)
+                await db.commit()
+        else:
+            raise Exception(file_content_result[1])
     except Exception as e:
             ##fallback to remove all the associated data
             await file_upload_revert_handler(file=file, session_id=session_id, chromadb_client=chromadb_client, db=db)
@@ -183,4 +163,15 @@ def run_docker_commands(thread_id: str, exe_cmds: list[str], code_files: list[di
     except Exception as e:
         return (False, ";".join(results + [error_result]))
 
-            
+
+async def safely_ainvoke(*, model: BaseChatModel, message_sequence: list[BaseMessage])->tuple[bool, object]:
+    '''
+    async invoke response with data type validate and any other exception graceful handle
+    '''
+    try:
+        response = await model.ainvoke(message_sequence)
+        if response is None:
+            raise ValueError("LLM error: Reponse is None...Please retry")
+    except Exception as e:
+        return (False, str(e))
+    return (True, response)

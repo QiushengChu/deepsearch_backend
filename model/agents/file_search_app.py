@@ -1,4 +1,5 @@
 import os
+import asyncio
 from model.file_parser import Chromadb_agent
 from langgraph.graph import StateGraph, START
 from typing import TypedDict, Sequence, Annotated, Literal, List
@@ -13,6 +14,9 @@ from model import message_event
 from model.session_manager import manager
 from time import time
 from pydantic import BaseModel, Field
+from collections import defaultdict
+import bm25s.high_level as bm25
+from chromadb.api.models.Collection import Collection
 
 
 
@@ -33,6 +37,61 @@ class File_Search_State(TypedDict):
     tool_call_id: str
 
 chromadb_search_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"), temperature=0, top_p=0.1)
+
+def vector_search_sort(
+        collection: Collection,
+        search_words: list[str],
+        file_name: str
+    )->list[tuple]:
+    '''
+    searching chromadb chunks via search keywords in ONE collections
+    return sorted list of tuple (id, distance, document)
+    '''
+    DISTANCE_THRESHOLD = 1.7
+    MAX_RESULTS = 20
+    try:
+        ##perform search query in the vector DB
+        results = collection.query(
+            query_texts=search_words,
+            n_results=MAX_RESULTS,
+            include=["documents", "metadatas", "distances"]
+        )
+        ##merge and scored each chunk
+        filtered_chunks = []
+        if results["ids"]:
+            for id in range(len(results["ids"])): ## for example there are 4 search words for the prompt
+                merged_chunks = list(zip(results["ids"][id], results["distances"][id], results["documents"][id]))
+                filtered_chunks += [each for each in merged_chunks if each[1] < DISTANCE_THRESHOLD]
+        filtered_chunks.sort(key=lambda x:x[1])
+        return filtered_chunks
+    except ValueError:
+        return [str({
+            "file": file_name,
+            "query": search_words,
+            "error": f"File '{file_name}' not found in session"
+        })]
+    except Exception as e:
+        return [str({
+            "file": file_name,
+            "query": search_words,
+            "error": str(e)
+        })]
+    
+def bm25_search_sort(
+        collection: Collection, 
+        search_keywords: list[str],
+    )->list[dict]:
+    '''
+    return list of sorted and merged dict {"id": 1, "score": 1.1, "document": "xxx"}
+    '''
+    all_chunks = collection.get(include=["documents"])
+    retriever = bm25.index(all_chunks["documents"])
+    bm25_results =[each_chunk for each in retriever.search(search_keywords) for each_chunk in each]
+    filterd_bm25_results = [each for each in bm25_results if each["score"] > 0]
+    filterd_bm25_results.sort(key=lambda x: x["score"], reverse=True)
+    return filterd_bm25_results
+
+
 
 @tool
 async def chromadb_search(search_collection_list: List[Search_Sentence_Collection], thread_id: Annotated[str, InjectedState("thread_id")], tool_call_id: Annotated[str, InjectedState("tool_call_id")])->ToolMessage:
@@ -56,32 +115,36 @@ async def chromadb_search(search_collection_list: List[Search_Sentence_Collectio
     """
     system_prompt = "Please summarize the contents extracted from the the files, the output should be " \
     "file: $file_name, relevent_content: $summary. Please Notice there are might be irrelevant information or duplicates in content chunks"
-
-    MAX_RESULTS = 20
-    DISTANCE_THRESHOLD = 1.7
+    ##for vector db search
+    K = 60
     all_results = []
 
     chromadb_agent = Chromadb_agent()
     for search_params in search_collection_list:
+        scored_chunks = defaultdict(lambda: {"score": 0, "id": None})
         try:
-            collecion_name = f"{thread_id}_{search_params.file_name}"
+            collecion_name = f"{thread_id}_{search_params.file_name}".replace(" ", "_")
             collection = chromadb_agent.chromadb_client.get_collection(collecion_name)
+            ## vector db search
+            filtered_chunks = await asyncio.to_thread(vector_search_sort, collection, search_params.search_sentences, search_params.file_name)
 
-            ##perform search query
-            results = collection.query(
-                query_texts=search_params.search_sentences,
-                n_results=MAX_RESULTS,
-                include=["documents", "metadatas", "distances"]
-            )
-            if results["ids"][0]:
-                ##Filter by similarity threshold
-                for i, distance in enumerate(results["distances"][0]):
-                    if distance < DISTANCE_THRESHOLD:
-                        all_results.append(str({
-                            "file": search_params.file_name,
-                            "queries": search_params.search_sentences,
-                            "content": results["documents"][0][i]
-                        }))
+            ## bm25 serch
+            filterd_bm25_results = await asyncio.to_thread(bm25_search_sort, collection, search_params.search_sentences)
+            
+            for rank, (chunk_id, _, chunk) in enumerate(filtered_chunks):
+                scored_chunks[chunk]["score"] += 1 / (K + rank)
+                scored_chunks[chunk]["id"] = int(chunk_id.split("_")[-1])
+            
+            for rank, each in enumerate(filterd_bm25_results):
+                scored_chunks[each["document"]]["score"] += 1 / (K + rank)
+            
+            sorted_scored_chunks = sorted(scored_chunks.items(), key=lambda item: item[1]["score"], reverse=True)[: int(len(scored_chunks) * 0.7)]
+            reordered_chunks = sorted(sorted_scored_chunks, key=lambda item: item[1]["id"], reverse=False)
+            all_results.append(str({
+                "file": search_params.file_name,
+                "relevant_content": "\n".join([each[0] for each in reordered_chunks]),
+                "queries": search_params.search_sentences
+            }))
         except ValueError:
             all_results.append(str({
                 "file": search_params.file_name,

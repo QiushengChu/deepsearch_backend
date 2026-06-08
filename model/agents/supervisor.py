@@ -6,6 +6,7 @@ from langchain_core.messages import BaseMessage, AIMessage, SystemMessage
 from langgraph.graph.message import add_messages
 from model.request_models import ROUTE_JSON_SCHEMA
 from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
 from langgraph.types import Command
 from model.session_manager import manager
 from utils.context import prompt_fetcher_from_cache, prompt_remover_from_cache
@@ -20,7 +21,6 @@ from model.agents.topic_summary_app import topic_summary_app
 from model.agents.search_app import search_app
 from model.agents.report_writer_app import report_writer_app
 from model.agents.file_search_app import file_search_app
-from model.agents.file_generator_app import file_generator_app
 from model.agents.coding_app import coding_app
 
 
@@ -35,10 +35,13 @@ class Supervisor_State(TypedDict):
     pause_required: bool
     message_user: bool
 
-supervisor_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"), top_p=0.1, temperature=0).with_structured_output(ROUTE_JSON_SCHEMA)
-#supervisor_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0).with_structured_output(Route)
+#supervisor_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"), top_p=0.1, temperature=0).with_structured_output(ROUTE_JSON_SCHEMA)
+supervisor_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0).with_structured_output(ROUTE_JSON_SCHEMA)
 
-async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Literal["clarify_app", "topic_summary_app", "search_app", "report_writer_app", "coding_app", "__end__"]]:
+async def supervisor_agent(
+    state: Supervisor_State, 
+    Config=None
+)->Command[Literal["clarify_app", "topic_summary_app", "search_app", "report_writer_app", "coding_app", "__end__"]]:
     '''
     supervise agent is for routing the message states between different sub-agents for completing the deligated tasks.
     '''
@@ -80,6 +83,7 @@ async def supervisor_agent(state: Supervisor_State, Config=None)->Command[Litera
     - report_writer_app is ONLY for text responses
     - NEVER expect report_writer_app to generate files
     - If user has uploaded any file please include the file_name into the reasoning for a conprehensive reasoning
+    - If coding_app just completed the coding task, DONT route back to it as a infinite dead loop, unless the coding task failed.
     '''
     ##    - If previous agent was "file_generator_agent" → route to "report_writer_app" (to summarize results)
     ##if pause_required is True then go to __end__
