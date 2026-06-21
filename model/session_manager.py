@@ -1,6 +1,7 @@
 from typing import Dict
 from fastapi import WebSocket
 import asyncio
+from typing import Literal
 
 class ConnectionManager:
     def __init__(self):
@@ -26,10 +27,11 @@ class ConnectionManager:
             del self.session_states[thread_id]
         print(f"Client disconnected")
 
-    async def send_event(self, thread_id: str, event: dict):
+    async def send_event(self, thread_id: str, event: dict, message_type: Literal["ui_message", "event"] = "event"):
         if thread_id in self.active_connections:
             try:
                 event_with_meta = {
+                    "message_type": message_type,
                     "event_id": f"evt_{str(self.session_states[thread_id]['message_count'])}",
                     "timestamp": asyncio.get_event_loop().time(),
                     **event

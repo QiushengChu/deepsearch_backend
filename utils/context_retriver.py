@@ -22,16 +22,34 @@ async def context_retriveral(thread_id: str):
                     "type": "human_input", 
                     "sender": "human",
                     "content": message.content,
-                    "fileNames": message.additional_kwargs["file_names"],
+                    "fileNames": message.additional_kwargs.get("file_names", []),
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "total_tokens": 0
                 })
-            elif message.type == "ai" and message.additional_kwargs.get("message_user", None):
-                await manager.send_event(thread_id=thread_id, event=message.additional_kwargs["message_event"])
+            elif message.type == "ai" and message.additional_kwargs.get("message_user", False):
+                await manager.send_event(thread_id=thread_id, event=message.additional_kwargs)
             elif message.type == "tool":
                 await manager.send_event(thread_id=thread_id, event=message.additional_kwargs)
+    ##streaming UI message
+    if state[0].get("ui_messages", []):
+        for message in state[0].get("ui_messages", []):
+            if message.type == "human":
+                await manager.send_event(thread_id=thread_id, message_type="ui_message",
+                    event={
+                        "type": "human_input", 
+                        "sender": "human",
+                        "content": message.content,
+                        "fileNames": message.additional_kwargs.get("file_names", []),
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0
+                    }
+                )
+            elif message.type == "ai":
+                await manager.send_event(thread_id=thread_id, message_type="ui_message", event=message.additional_kwargs)
     return 
+
         
                 
                 

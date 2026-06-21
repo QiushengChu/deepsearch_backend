@@ -27,7 +27,13 @@ async def invoke(user_input: str, thread_id: str, file_names: list[str]) :
                 additional_kwargs={
                     "file_names": file_names
                 }
-            )], 
+            )],
+            "ui_messages": [HumanMessage(
+                content=user_input,
+                additional_kwargs={
+                    "file_names": file_names
+                }
+            )],
             "sender": "user", 
             "thread_id": thread_id,
             "pause_required": False,

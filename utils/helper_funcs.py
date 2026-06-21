@@ -4,19 +4,23 @@ from fastapi import File
 from model.file_parser import Chromadb_agent
 from sqlalchemy.ext.asyncio import AsyncSession
 from openai import AsyncOpenAI
-from fastapi import UploadFile
-from io import BytesIO
-import pdfplumber
 from model.sqlite import SummaryIndex, AsyncSessionLocal
 from sqlalchemy import delete, and_, select
 from datetime import datetime
-import logging
 from pathlib import Path
 import docker
 import time
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from utils.file_content_extractor import file_content_extract
+from typing import Type
+from pydantic import BaseModel
+from langchain_openai import ChatOpenAI
+from utils.token_counter import get_token_counts
+from model.file_upload_models import UploadedFile
+from model.session_manager import manager
+import asyncio
+from model.code_app_models import Code
 
 
 async def generate_file_summary(file_content: str )->str:
@@ -38,8 +42,8 @@ async def generate_file_summary(file_content: str )->str:
 
 async def file_upload_revert_handler(file: File, session_id: str, chromadb_client: Chromadb_agent, db: AsyncSession):
     ##remove residual file
-    if os.path.exists(f"uploads/{session_id}/{file.filename}"):
-        os.remove(f"uploads/{session_id}/{file.filename}")
+    # if os.path.exists(f"uploads/{session_id}/{file.filename}"):
+    #     os.remove(f"uploads/{session_id}/{file.filename}")
 
     ##remove residual summary index
     delete_statement = delete(SummaryIndex).where(
@@ -55,8 +59,9 @@ async def file_upload_revert_handler(file: File, session_id: str, chromadb_clien
     chromadb_client.remove_collection_by_filename(session_id=session_id, filename=file.filename)
 
 
-async def file_upload_handler(file: File, session_id: str, chromadb_client: Chromadb_agent)->dict[str, str|bool]:
+async def file_upload_handler(file: File, session_id: str, chromadb_client: Chromadb_agent)->UploadedFile:
     file_path = Path((f"coding_space/{session_id}/{file.filename}"))
+    MAX_INDEX_THRESHOLD = 320_000
     os.makedirs(file_path.parent, exist_ok=True)
     try:
         ##save the file into the directory
@@ -65,46 +70,76 @@ async def file_upload_handler(file: File, session_id: str, chromadb_client: Chro
             await buffer.write(content)
 
         ##content extract
-        # file_content = await extract_content(file=file)
         file_content_result = await file_content_extract(file_path=file_path)
         if file_content_result[0]:
-            ##indexing the uploads
-            await chromadb_client.index_file(session_id=session_id,  filename=file.filename, text=file_content_result[1])
-            ##generate summary and save it into sqlite
-            summary = await generate_file_summary(file_content=file_content_result[1])
+            num_tokens = await asyncio.to_thread(get_token_counts, file_content_result[1])
+            if num_tokens < MAX_INDEX_THRESHOLD:
+                ##indexing the uploads
+                await chromadb_client.index_file(session_id=session_id,  filename=file.filename, text=file_content_result[1])
+                ##generate summary and save it into sqlite
+                summary = await generate_file_summary(file_content=file_content_result[1])
 
-            ##each corutines must use a different db session
-            async with AsyncSessionLocal() as db:
-                ##upsert ops the summary index record
-                result = await db.execute(
-                    select(SummaryIndex).where(
-                        and_(
-                            SummaryIndex.session_id == session_id,
-                            SummaryIndex.file_name == file.filename
+                ##each corutines must use a different db session
+                async with AsyncSessionLocal() as db:
+                    ##upsert ops the summary index record
+                    result = await db.execute(
+                        select(SummaryIndex).where(
+                            and_(
+                                SummaryIndex.session_id == session_id,
+                                SummaryIndex.file_name == file.filename
+                            )
                         )
                     )
+                    existing_summary = result.scalar_one_or_none()
+                    if existing_summary:
+                        existing_summary.summary = summary
+                        existing_summary.updated_at = datetime.now()
+                    else:
+                        new_summary = SummaryIndex(
+                            session_id=session_id,
+                            file_name=file.filename,
+                            summary=summary,
+                            updated_at=datetime.now()
+                        )
+                        db.add(new_summary)
+                    await db.commit()
+                return UploadedFile(
+                    file_name=file.filename, 
+                    estimated_tokens=num_tokens, 
+                    process_method="file_search", 
+                    result=True
                 )
-                existing_summary = result.scalar_one_or_none()
-                if existing_summary:
-                    existing_summary.summary = summary
-                    existing_summary.updated_at = datetime.now()
-                else:
-                    new_summary = SummaryIndex(
-                        session_id=session_id,
-                        file_name=file.filename,
-                        summary=summary,
-                        updated_at=datetime.now()
-                    )
-                    db.add(new_summary)
-                await db.commit()
-        else:
-            raise Exception(file_content_result[1])
+        return UploadedFile(
+            file_name=file.filename, 
+            estimated_tokens=0, 
+            process_method="coding", 
+            result=False
+        )
     except Exception as e:
-            ##fallback to remove all the associated data
             await file_upload_revert_handler(file=file, session_id=session_id, chromadb_client=chromadb_client, db=db)
-            return {"name": file.filename, "result": False}
-    return {"name": file.filename, "result": True}
+            return UploadedFile(
+                file_name=file.filename, 
+                estimated_tokens=0, 
+                process_method="coding", 
+                result=False
+            )
 
+def get_uploaded_file_from_session(session_id: str)->str | None:
+    '''
+    getting the file upload status from the session, only getting once
+    '''
+    session = manager.get_session(thread_id=session_id)
+    if session.get("file_upload", []): ##if there is any existing file upload
+        file_upload_summary = ""
+        for each_file in session.get("file_upload"):
+            process_method = "writing code app to process" if each_file.process_method == "coding" else "using file search app to search"
+            file_upload_summary += f"File name: {each_file.file_name}, MUST ROUTE TO: {process_method} agent to process"
+        manager.update_session(thread_id=session_id, updates={**session, "file_upload": []}) ## remove upload record once read
+        return file_upload_summary
+    else:
+        return None
+    
+    
 
 async def summary_fetcher(session_id: str)-> tuple[bool, str | None]:
     async with AsyncSessionLocal() as db:
@@ -117,7 +152,7 @@ async def summary_fetcher(session_id: str)-> tuple[bool, str | None]:
         else:
             return (False, None)
         
-def run_docker_commands(thread_id: str, exe_cmds: list[str], code_files: list[dict])->tuple[bool, str]:
+def run_docker_commands(thread_id: str, exe_cmds: list[str], code_files: list[Code])->tuple[bool, str]:
     '''
     checking if container with thread_id already running, if not run it
     then running the commands in loop
@@ -126,6 +161,9 @@ def run_docker_commands(thread_id: str, exe_cmds: list[str], code_files: list[di
     host_path = os.path.abspath(f"coding_space/{thread_id}")
     if code_files: ##writing code into files
         for each in code_files:
+            file_name = each.file_name.strip()
+            if not file_name or file_name in [".", ".."]:
+                continue
             with open(f"{host_path}/{each.file_name}", "w") as f:
                 f.write(each.code_text)
     results = []
@@ -164,14 +202,49 @@ def run_docker_commands(thread_id: str, exe_cmds: list[str], code_files: list[di
         return (False, ";".join(results + [error_result]))
 
 
-async def safely_ainvoke(*, model: BaseChatModel, message_sequence: list[BaseMessage])->tuple[bool, object]:
+async def safely_ainvoke(
+        *, 
+        model: BaseChatModel, 
+        message_sequence: list[BaseMessage], 
+        null_response_model_switch: bool = True,
+        circuit_break_threshold: int = 3,
+        response_schema: Type[BaseModel] = None ##response schema type
+    )->tuple[bool, object]:
     '''
-    async invoke response with data type validate and any other exception graceful handle
+    async invoke response with data type validate and any other exception graceful handle,
+    if null_response_model_switch is True if there are 3 consecvtive null response then switch model
     '''
+    NULL_RESPONSE_ERROR = "LLM error: Reponse is None...Please retry"
+    if null_response_model_switch:
+        pos = 0
+        consecutive_counter = 0
+        consecutive_group = 0
+        while pos < len(message_sequence):
+            if NULL_RESPONSE_ERROR in message_sequence[pos].content:
+                consecutive_counter += 1
+                if consecutive_counter == circuit_break_threshold:
+                    consecutive_group += 1
+                    consecutive_counter = 0
+                    pos += 1
+                else:
+                    pos += 2
+            else:
+                consecutive_counter = 0
+                pos += 1
+
+        if consecutive_group % 2:
+            ##model failover
+            failover_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0)
+            print("Failover to gpt-4o")
+            if response_schema:
+                model = failover_model.with_structured_output(response_schema)
+        else:
+            print("Using deepseek")
+
     try:
         response = await model.ainvoke(message_sequence)
         if response is None:
-            raise ValueError("LLM error: Reponse is None...Please retry")
+            raise ValueError(NULL_RESPONSE_ERROR)
     except Exception as e:
         return (False, str(e))
     return (True, response)

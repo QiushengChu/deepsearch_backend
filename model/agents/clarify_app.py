@@ -16,6 +16,7 @@ load_dotenv()
 
 class Clarify_State(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    ui_messages: Annotated[Sequence[BaseMessage], add_messages]
     sender: str
     thread_id: str
     pause_required: bool
@@ -52,20 +53,25 @@ async def clarify_agent(state: Clarify_State)->Command[Literal["__end__"]]:
         input_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         output_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         total_tokens = getattr(response, "usage_metadata", {}).get("total_tokens", 0),
-        timestamp = time()
+        timestamp = time(),
+        message_user = True
     )
     if response.need_to_clarify: ##AI needs further clarify with user
-        await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
+        await manager.send_event(thread_id=state["thread_id"], event=event.model_dump()) ## for event streaming, 
+        await manager.send_event(thread_id=state["thread_id"], event=event.model_dump(), message_type="ui_message") ##for UI streaming
         return Command(
             goto="__end__",
-            update={"messages": state["messages"] + [AIMessage(content=ai_clarify_str, additional_kwargs={"message_user": True, "message_event": event})],
-                    "sender": "clarify_agent",
-                    "pause_required": True
-                }
+            update={
+                "messages": [AIMessage(content=ai_clarify_str, additional_kwargs=event.model_dump())],
+                "ui_messages": [AIMessage(content=ai_clarify_str, additional_kwargs=event.model_dump())],
+                "sender": "clarify_agent",
+                "pause_required": True
+            }
         )
     else:
         return Command(goto="__end__", update={
-            "messages": state["messages"] + [AIMessage(content=ai_clarify_str, additional_kwargs={"message_user": False, "message_event": event})],
+            "messages": [AIMessage(content=ai_clarify_str, additional_kwargs={**event.model_dump(), "message_user": False})],
+                # "message_user": False, "message_event": event})],
             "sender": "clarify_agent",
             "thread_id": state["thread_id"],
             "pause_required": False

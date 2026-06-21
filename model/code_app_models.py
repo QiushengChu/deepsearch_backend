@@ -3,10 +3,13 @@ from typing import Literal
 
 class AgentForward(BaseModel):
     spec: str | None = Field(default=None, description="""Detailed summary of the user's coding task when task is about to start. MUST include:
-    1. Goal: What the user wants to achieve
+    1. Goal: What the user wants to achieve, DONT including sequential task belong to other agent into the goal AT ALL, DONT overlap with what file search agent will do.
     2. User-provided data: Copy the EXACT details user provided (names, content, datasets, etc.). DO NOT paraphrase or generalize.
-    3. Output: Expected file format, file name, path
-    4. Constraints: Libraries, style, language requirements""")
+    3. Output: Expected file format, file name, path.
+    4. Constraints: Libraries, style, language requirements
+    You MUST follow routing suggestion from supervisor agent about which uploaded or generated file that you should process (DONT add file supposed to be processed by file_search_agent)
+    You MUST EXACTLY follow routing reason for getting the clear definition of the coding task. NEVER DO MORE, if the routing reason is asking for extracting information, NEVER do analysis..
+    """)
     task_complete_summary: str | None = Field(default=None, description="The summarization of the completed task when task is complete")
     output_obj_path: list[str] | None = Field(default=None, description="The file path of the generated output artifacts (e.g. PDF, CSV, image, report). Populate this ONLY if the user's goal is to produce a downloadable file or document. Set to None if the user wants a text-based analysis result instead. If artifact(s) is generated, No need to have output_result")
     output_result: str | None = Field( default=None, description="The final text response to the user. Use this when the user wants an analytical result, summary, or insight (e.g. data analysis, statistics, predictions). Only When user is asking for analsis related topic")
@@ -22,9 +25,10 @@ class AgentForward(BaseModel):
 class Plans(BaseModel):
     steps: list[str] = Field(
         ..., 
-        description="The content for the todo.md for each task and its progress is explicitly defined..", 
+        description="The content for the todo.md for each task and its progress is explicitly defined.." \
+        "NOTICE: if from the previous todo, there is something (code, generated files and anything else) you can reuse, YOU MUST NOT REINVENT WHEEL",
         examples=[
-            "- [ ] Step 1: List all files in the current directory.",
+            "- [ ] Step 1: Check if the any files can be reused...",
             "- [ ] Step 2: Read the content of the PDF file 'document.pdf'.",
             "- [ ] Step 3: Analyze the extracted text to find all email addresses using a regular expression.",
             "- [ ] Step 4: Save the found email addresses to a new file named 'emails.txt'."

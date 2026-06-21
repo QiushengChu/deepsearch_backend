@@ -4,7 +4,7 @@ from model.file_parser import Chromadb_agent
 from langgraph.graph import StateGraph, START
 from typing import TypedDict, Sequence, Annotated, Literal, List
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_core.messages import BaseMessage, AIMessage, ToolMessage, SystemMessage, HumanMessage
 from langgraph.types import Command
 from langchain_deepseek import ChatDeepSeek
 from langchain_core.tools import tool
@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 from collections import defaultdict
 import bm25s.high_level as bm25
 from chromadb.api.models.Collection import Collection
+from langgraph.errors import GraphRecursionError
+from langchain_openai import ChatOpenAI
 
 
 
@@ -30,13 +32,16 @@ class Search_Sentence_Collection(BaseModel):
 
 class File_Search_State(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    internal_messages: Annotated[Sequence[BaseMessage], add_messages]
     sender: str
     thread_id: str
     pause_required: bool
     message_user: bool
     tool_call_id: str
+    search_round: int
 
-chromadb_search_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"), temperature=0, top_p=0.1)
+summary_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"), temperature=0, top_p=0.1)
+MAX_SEARCH_ATTEMPTS = 5
 
 def vector_search_sort(
         collection: Collection,
@@ -94,7 +99,11 @@ def bm25_search_sort(
 
 
 @tool
-async def chromadb_search(search_collection_list: List[Search_Sentence_Collection], thread_id: Annotated[str, InjectedState("thread_id")], tool_call_id: Annotated[str, InjectedState("tool_call_id")])->ToolMessage:
+async def chromadb_search(
+    search_collection_list: List[Search_Sentence_Collection], 
+    thread_id: Annotated[str, InjectedState("thread_id")], 
+    tool_call_id: Annotated[str, InjectedState("tool_call_id")]
+)->ToolMessage:
     """
     Search for relevant information in uploaded files using ChromaDB.
     
@@ -123,8 +132,8 @@ async def chromadb_search(search_collection_list: List[Search_Sentence_Collectio
     for search_params in search_collection_list:
         scored_chunks = defaultdict(lambda: {"score": 0, "id": None})
         try:
-            collecion_name = f"{thread_id}_{search_params.file_name}".replace(" ", "_")
-            collection = chromadb_agent.chromadb_client.get_collection(collecion_name)
+            normalized_collection_name = Chromadb_agent.collection_name_normalize(session_id=thread_id, filename=search_params.file_name)
+            collection = chromadb_agent.chromadb_client.get_collection(normalized_collection_name)
             ## vector db search
             filtered_chunks = await asyncio.to_thread(vector_search_sort, collection, search_params.search_sentences, search_params.file_name)
 
@@ -160,47 +169,19 @@ async def chromadb_search(search_collection_list: List[Search_Sentence_Collectio
 
     if all_results:
         raw_relevant_contents = "\n".join(all_results)
-        response = await chromadb_search_model.ainvoke(
+        response = await summary_model.ainvoke(
             [SystemMessage(system_prompt)] + [AIMessage(raw_relevant_contents)] 
-        )
-        event = message_event.Event(
-            type = "file search agent has summarized the result ",
-            sender = "file_search_tool",
-            content = response.content,
-            input_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
-            output_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
-            total_tokens = getattr(response, "usage_metadata", {}).get("total_tokens", 0),
-            timestamp = time()
         )
         return ToolMessage(
             tool_call_id=tool_call_id, 
             content=response.content, 
-            additional_kwargs={
-                "sender": "file_search_tool", 
-                "message_user": False,
-                "message_event": event.model_dump(),
-                "timestamp": time()
-            }
+            # additional_kwargs=event.model_dump()
         )
     else:
-        event = message_event.Event(
-            type = "file search agent cannot find related information ",
-            sender = "file_search_tool",
-            content = "No relevant information found in the uploads",
-            input_tokens = 0,
-            output_tokens = 0,
-            total_tokens = 0,
-            timestamp = time()
-        )
         return ToolMessage(
             tool_call_id=tool_call_id, 
             content="No relevant information found in the uploads", 
-            additional_kwargs={
-                "sender": "file_search_tool", 
-                "message_user": False,
-                "message_event": event.model_dump(),
-                "timestamp": time()
-            }
+            # additional_kwargs=event.model_dump()
         )
 
 
@@ -211,9 +192,25 @@ async def file_search_agent(state: File_Search_State)->Command[Literal["__end__"
     The purpose of the file_search_agent is for finding the relevant information from the uploaded file chunked and 
     indexed in the chromadb 
     '''
-    system_prompt = "You are the file search agent, according to latest user prompt, the the most relevant information which can help to answer the question"
+    filenames = []
+    for each_message in state["messages"]:
+        if isinstance(each_message, HumanMessage) and each_message.additional_kwargs.get("file_names", []):
+            filenames += each_message.additional_kwargs.get("file_names")
 
-    response = await file_search_model.ainvoke(state["messages"] + [SystemMessage(content=system_prompt)])
+    system_prompt = "You are the file search agent, according to latest user prompt, the the most relevant information which can help to answer the question."
+    if filenames:
+        system_prompt += f"\nUser has uploaded files {' '.join(filenames)}. Please use it for file search..."
+        "ONLY Search the file content which is belonging to file_search, DONT search on file belong to coding_app"
+        "You MUST RESTRICTLY follow routing suggestion from supervisor agent in terms of which file you should search on"
+
+    ###deadloop here
+    if state["internal_messages"]:
+        message_sequence = state["internal_messages"] + [SystemMessage(content=system_prompt)]
+    else:
+        message_sequence = state["messages"] + [SystemMessage(content=system_prompt)]
+
+    response = await file_search_model.ainvoke(message_sequence, config={"recursion_limit": 8})
+
     event = message_event.Event(
         type = "file_search_agent",
         sender = "file_search_agent",
@@ -222,28 +219,42 @@ async def file_search_agent(state: File_Search_State)->Command[Literal["__end__"
         input_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         output_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         total_tokens = getattr(response, "usage_metadata", {}).get("total_tokens", 0),
-        timestamp = time()
+        timestamp = time(),
+        message_user = True
     )
 
-    response.additional_kwargs = {"message_user": True, "message_event": event}
+    response.additional_kwargs = event.model_dump()
     await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
     if hasattr(response, "tool_calls") and response.tool_calls:
+        if state.get("search_round", 0) + 1 > MAX_SEARCH_ATTEMPTS:
+            max_search_round_summary = await summary_model.ainvoke(state["internal_messages"] + [HumanMessage(content="As the maxium search reached, summarize the full search result for the next task..")])
+            return Command(
+                goto="__end__",
+                update={
+                    "messages": state["messages"] + [HumanMessage(content=f"File serach agent has reached MAXIUM SEARCH ATTEMPTS. Here is the summary: \n{max_search_round_summary}")],
+                    "thread_id": state["thread_id"],
+                    "sender": "file_search_agent",
+                    "search_round": MAX_SEARCH_ATTEMPTS
+                }
+            )
         return Command(
             goto=response.tool_calls[0].get("name", "__end__"),
             update={
-                "messages": state["messages"] + [response],
+                "internal_messages": message_sequence + [response],
                 "sender": "file_search_agent",
                 "thread_id": state["thread_id"],
                 "pause_required": False,
                 "message_user": True,
-                "tool_call_id": response.tool_calls[0]['id']
+                "tool_call_id": response.tool_calls[0]['id'],
+                "search_round": state.get("search_round", 0) + 1
             }
         )
     else:
+        summary = await summary_model.ainvoke(message_sequence + [HumanMessage(content="Now to full search is complete. synthesize all the key search result for the next stage..")])
         return Command(
             goto="__end__",
             update={
-                "messages": state["messages"] + [response],
+                "messages": [AIMessage(content=f"File serach agent has full searched the document. Here is the summary: \n{summary}")],
                 "thread_id": state["thread_id"],
                 "sender": "file_search_agent"
             }
@@ -251,7 +262,7 @@ async def file_search_agent(state: File_Search_State)->Command[Literal["__end__"
 
 file_search_app_graph = StateGraph(File_Search_State)
 file_search_app_graph.add_node("file_search_agent", file_search_agent)
-file_search_app_graph.add_node("chromadb_search", ToolNode([chromadb_search]))
+file_search_app_graph.add_node("chromadb_search", ToolNode([chromadb_search], messages_key="internal_messages"))
 file_search_app_graph.add_edge(START, "file_search_agent")
 file_search_app_graph.add_edge("chromadb_search", "file_search_agent")
 file_search_app = file_search_app_graph.compile()

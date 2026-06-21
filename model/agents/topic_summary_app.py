@@ -8,7 +8,6 @@ from model.request_models import Topics
 from langchain_deepseek import ChatDeepSeek
 from langgraph.types import Command
 from model.session_manager import manager
-# from concurrent.futures import ThreadPoolExecutor
 from utils.context import context_purifier
 from model import message_event
 from time import time
@@ -45,10 +44,11 @@ async def topic_summary_agent(state: Summary_State)-> Command[Literal["__end__"]
         input_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         output_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         total_tokens = getattr(response, "usage_metadata", {}).get("total_tokens", 0),
-        timestamp = time()
+        timestamp = time(),
+        message_user = True
     )
     await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
-    ai_message.additional_kwargs={"message_user": True, "message_event": event}
+    ai_message.additional_kwargs=event.model_dump()
     return Command(
         goto="__end__",
         update={

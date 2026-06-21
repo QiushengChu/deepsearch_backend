@@ -76,83 +76,18 @@ def safe_json_dumps(obj) -> str:
         return json.dumps(obj, ensure_ascii=True, default=str)
 
 
-search_summary_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"), top_p=0.1, temperature=0)
-#search_summary_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0)
-
-# @tool
-# async def search_tool(topics: List[str], thread_id: Annotated[str, InjectedState("thread_id")], tool_call_id: Annotated[str, InjectedState("tool_call_id")])->ToolMessage: ##inject thread_id here
-#     '''
-#     search_tool is for finding the relevant information over the internet via the tavily client
-#     Args:
-#         topics(List[str]): the list of search topics that the search tool will need to search the relevant information
-#     Return:
-#         a list of dict of the information of each topics
-#     '''
-#     tavily_api_key = os.getenv("tavily_api_key")
-#     client = AsyncTavilyClient(api_key=tavily_api_key)
-#     # with ThreadPoolExecutor(max_workers=5) as executor:
-#     #     results = await list(executor.map(lambda topic: client.search(topic), topics))
-#     corotines = [client.search(topic) for topic in topics]
-#     # task_list = asyncio.create_task(corotines)
-#     results = await asyncio.gather(*corotines)
-#     total_links = []
-#     max_response_time = 0
-#     mapped_results = []
-#     for each in results:
-#         mapped_results.append({
-#             "query": each["query"],
-#             "results": [ {k: v for k, v in single_source.items() if k != "url"} for single_source in each["results"]]
-#         })
-#         total_links.extend([x["url"] for x in each["results"]])
-#         max_response_time = max_response_time if each["response_time"] < max_response_time else each["response_time"]
-#     # links_text = '\n'.join(total_links)
-#     await manager.send_event(thread_id=thread_id, event={
-#         "type": "search_event",
-#         "sender": "search_agent",
-#         "content": f"found the results from the following links about the breakdown research topics.",
-#         "links": total_links,
-#         "input_tokens": 0,
-#         "output_tokens": 0,
-#         "total_tokens": 0,
-#         "timestamp": time()
-#     })
-#     ##need to summarize the search result to avoid gargage information in the search result
-#     system_message ='''Please summarize the search result without losing any important information but remove all irrelevance, such as invalid chars, ads etc
-#     These are the topics:{}
-#     '''.format(', '.join(topics))
-#     all_messages = [SystemMessage(content=system_message)] + [HumanMessage(content=json.dumps({"mapped_results": mapped_results}).encode().decode('unicode_escape'))]
-#     response = await search_summary_model.ainvoke(all_messages)
-#     event = message_event.Event(
-#         type = "search_event",
-#         sender = "search_agent",
-#         content = "search_agent is summarizing the search result",
-#         links = total_links,
-#         input_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
-#         output_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
-#         total_tokens = getattr(response, "usage_metadata", {}).get("total_tokens", 0),
-#         timestamp=time()
-#     )
-#     await manager.send_event(thread_id=thread_id, event=event.model_dump())
-#     return ToolMessage(
-#         tool_call_id=tool_call_id, 
-#         content=response.content, 
-#         additional_kwargs={
-#             "max_response_time": max_response_time, 
-#             "total_num_links": len(total_links), 
-#             "sender": "search_tool", 
-#             "num_links": total_links,
-#             "message_user": False,
-#             "message_event": event.model_dump(),
-#             "links": total_links,
-#             "timestamp": time()
-#         }
-#     )
+search_summary_model = ChatDeepSeek(
+    model="deepseek-chat", 
+    api_key=os.getenv("api_key"), 
+    top_p=0.1, temperature=0,
+    extra_body={"thinking": {"type": "disabled"}}
+)
 
 @tool
 async def search_tool(
-    topics: List[str], 
     thread_id: Annotated[str, InjectedState("thread_id")], 
-    tool_call_id: Annotated[str, InjectedState("tool_call_id")]
+    tool_call_id: Annotated[str, InjectedState("tool_call_id")],
+    topics: List[str] = [], 
 ) -> ToolMessage:
     '''
     search_tool is for finding the relevant information over the internet via the tavily client
@@ -197,16 +132,18 @@ async def search_tool(
             max_response_time = max(max_response_time, each.get("response_time", 0))
         
         # Send event
-        await manager.send_event(thread_id=thread_id, event={
-            "type": "search_event",
-            "sender": "search_agent",
-            "content": f"Found results from {len(total_links)} links.",
-            "links": total_links,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "timestamp": time()
-        })
+        event = message_event.Event(
+            type = "search_event",
+            sender = "search_agent",
+            content = f"Found results from {len(total_links)} links.",
+            links = total_links,
+            input_tokens = 0,
+            output_tokens = 0,
+            total_tokens = 0,
+            timestamp = time(),
+            message_user = True
+        )
+        await manager.send_event(thread_id=thread_id, event=event.model_dump())
         
         # Summarize with safe JSON
         system_message = f'''Please summarize the search result without losing any important information but remove all irrelevance.
@@ -228,29 +165,30 @@ Topics: {', '.join(topics)}
         return ToolMessage(
             tool_call_id=tool_call_id,
             content=cleaned_response,
-            additional_kwargs={
-                "sender": "search_agent",
-                "message_user": False,
-                "links": total_links,
-                "timestamp": time()
-            }
+            additional_kwargs={**event.model_dump(), "message_user": False}
         )
         
     except Exception as e:
         print(f"Search tool error: {e}")
+        event = message_event.Event(
+            type = "search_tool_error",
+            sender = "search_agent",
+            message_user = False,
+            error = True,
+            timestamp = time()
+        )
         return ToolMessage(
             tool_call_id=tool_call_id,
             content=f"Search encountered an error: {str(e)}",
-            additional_kwargs={
-                "sender": "search_agent",
-                "message_user": False,
-                "error": True,
-                "timestamp": time()
-            }
+            additional_kwargs=event.model_dump()
         )
 
 
-search_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key")).bind_tools([search_tool])
+search_model = ChatDeepSeek(
+    model="deepseek-chat", 
+    api_key=os.getenv("api_key"),
+    extra_body={"thinking": {"type": "disabled"}}
+).bind_tools([search_tool])
 #search_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0).bind_tools([search_tool])
 
 async def search_agent(state: Search_State)->Command[Literal["__end__", "search_tool"]]:
@@ -270,16 +208,17 @@ async def search_agent(state: Search_State)->Command[Literal["__end__", "search_
         input_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         output_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         total_tokens = getattr(response, "usage_metadata", {}).get("total_tokens", 0),
-        timestamp = time()
+        timestamp = time(),
+        message_user = False
     )
-    response.additional_kwargs = {"message_user": False, "message_event": event.model_dump()}
+    response.additional_kwargs = event.model_dump()
     if hasattr(response, "tool_calls") and response.tool_calls:
         return Command(
             goto="search_tool",
             update={
                 "messages": state["messages"] + [response],
                 "sender": "search_agent",
-                "search_count": len(response.tool_calls[0]["args"]["topics"]),
+                "search_count": len(response.tool_calls[0]["args"].get("topics", [])),
                 "thread_id": state["thread_id"],
                 "tool_call_id": response.tool_calls[0]['id']
             }

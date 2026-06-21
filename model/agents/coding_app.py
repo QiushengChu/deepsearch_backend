@@ -3,14 +3,16 @@ from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, Human
 from langgraph.graph.message import add_messages
 from langgraph.graph import START, StateGraph
 from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
-from pydantic import BaseModel, Field, ValidationError
 import os, asyncio
 from utils.helper_funcs import run_docker_commands, safely_ainvoke
-from docker.errors import ContainerError, ImageNotFound, APIError
+from model.session_manager import manager
+from model import message_event
 from model.code_app_models import AgentForward, Plans, CodeList, Problem, Todo
+from time import time
 
 
 load_dotenv()
@@ -18,7 +20,7 @@ load_dotenv()
 
 class StateMessage(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    internal_messages: Annotated[Sequence[BaseMessage], add_messages]
+    internal_messages: Annotated[Sequence[BaseMessage], add_messages]  ##coding app internal messages
     steps: list[str]
     current_step_id: int
     initial_code: CodeList
@@ -28,7 +30,11 @@ class StateMessage(TypedDict):
     coding_task_complete: bool
     pause_required: bool
 
-agent_forward_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key")).with_structured_output(AgentForward)
+agent_forward_model = ChatDeepSeek(
+    model="deepseek-chat", 
+    api_key=os.getenv("api_key"), 
+    extra_body={"thinking": {"type": "disabled"}}
+).with_structured_output(AgentForward)
 
 async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "code_planner"]]:
     '''
@@ -38,7 +44,8 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
     if state.get("coding_task_complete", False):
         system_prompt = "As the coding task completed, specify either output_obj_path or output_result for the supervisor agent to send to user.."
 
-        response_tuple = await safely_ainvoke(model=agent_forward_model, message_sequence=state["internal_messages"] + [SystemMessage(content=system_prompt)])
+        response_tuple = await safely_ainvoke(model=agent_forward_model, message_sequence=state["internal_messages"] + [SystemMessage(content=system_prompt)], response_schema=AgentForward)
+        
         if not response_tuple[0]: ## if exception 
             return Command(
                 goto="agent_forward",
@@ -55,11 +62,24 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
             summary += f"\nOutput Object Path: {response.output_obj_path}"
         with open(f"coding_space/{state['thread_id']}/todo.md", "r") as f:
             todo_md = f.read()
+
+        event = message_event.Event(
+            type="coding_agent_complete_task",
+            sender="coding_agent",
+            content="coding agent has completed task",
+            timestamp = time(),
+            message_user = True
+        )
+        ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
+        await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
+        finish_message = AIMessage(content="From coding_app: " + f"{response.task_complete_summary if response.task_complete_summary else 'The coding task has been completed.'} \n This is todo.md for reference\n {todo_md}")
+        finish_message.additional_kwargs = event.model_dump()
+
         return Command(
             goto="__end__",
             update={
                 **state,
-                "messages": state["messages"] + [AIMessage(content="From coding_app: " + f"{response.task_complete_summary if response.task_complete_summary else 'The coding task has been completed.'} \n This is todo.md for reference\n {todo_md}")],
+                "messages": finish_message,
                 "sender": "coding_app"
             }
         )
@@ -73,9 +93,12 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
         - **Constraints**: Any specific requirements (e.g. libraries to use, style, language)
 
         Be specific. Do NOT generalize or paraphrase user's data - preserve the exact details provided. It will be used for the further agent to generate code.
+        You MUST follow routing suggestion from supervisor agent about which uploaded or generated file that you should process (DONT add file supposed to be processed by file_search_agent)
+        You MUST EXACTLY follow routing reason for getting the clear definition of the coding task. NEVER DO MORE, if the routing reason is asking for extracting information, NEVER do analysis..
         """
+        
         message_sequence = state["messages"] + [SystemMessage(content=system_prompt)]
-        response_tuple = await safely_ainvoke(model=agent_forward_model, message_sequence=message_sequence)
+        response_tuple = await safely_ainvoke(model=agent_forward_model, message_sequence=message_sequence, response_schema=AgentForward)
         if not response_tuple[0]:##exception happen
             return Command(
                 goto="agent_forward",
@@ -85,8 +108,17 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
                 }
             )
         response = response_tuple[1]
-        # response = await agent_forward_model.ainvoke(state["messages"] + [SystemMessage(content=system_prompt)])
         os.makedirs(name=f"coding_space/{state['thread_id']}", exist_ok=True)
+        event = message_event.Event(
+            type="coding_forard_agent_in_progress",
+            sender="coding_agent",
+            content="coding agent is forwarding",
+            timestamp = time(),
+            message_user = True
+        )
+        ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
+        await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
+        
         return Command(
             goto="code_planner",
             update={
@@ -99,42 +131,44 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
 
 
     
-code_planner_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key")).with_structured_output(Plans)
+# code_planner_model = ChatDeepSeek(
+#     model="deepseek-chat", 
+#     api_key=os.getenv("api_key"), 
+#     extra_body={"thinking": {"type": "disabled"}}
+# ).with_structured_output(Plans)
+
+code_planner_model = ChatOpenAI(
+    model="gpt-4o", 
+    api_key=os.getenv("openai_api_key")
+).with_structured_output(Plans)
 
 async def code_planner_node(state: StateMessage)->Command[Literal["code_generator"]]:
     '''
     creating code plan
     '''
-    system_prompt = """You are a master project planner for a team of AI coding agents. Your sole responsibility is to take a user's request and create a step-by-step plan in markdown format and steps string list. You do **not** write code.
-    **Your Workflow:**
+    system_prompt = """You are a project planner for AI coding agents. Decompose the user's goal into a detailed, step-by-step plan. Do NOT write code.
+        Core Principles:
+        1. **Granularity**: Break work into small, single-action steps. Prefer more steps over fewer.
+        2. **Reuse First**: Before writing new code, always check if existing files already solve part of the problem. Steps should explicitly say "check if X exists" or "reuse Y from file Z" before "create new Z".
+        3. **Stateless Start**: Assume no prior context. Start by exploring the environment (list files, read relevant existing code) unless the user provides context.
+        4. **Explicit Paths**: Mention file names, directories, and function names clearly.
+        5. **Minimal Changes for Updates**: If modifying existing code, use targeted CLI tools (sed, awk, patch) rather than rewriting entire files. Prefer incremental edits.
 
-    1.  **Analyze the Goal:** Carefully read the user's request and the conversation history to understand the ultimate objective.
-    2.  **Formulate a Strategy:** Think about the logical sequence of steps required to achieve the goal.
-    3.  **Decompose into steps:** Break down your strategy into a list of small, specific, and sequential steps.
+        Step Design Guidelines:
+        - If a file already exists and does what's needed → step = "Verify and reuse existing X"
+        - If a file exists but needs tweaking → step = "Modify line X in file Y using sed"
+        - Only if no file exists → step = "Create new file Z with initial implementation"
 
-    **Rules for Creating steps:**
-    *   **Granularity:** Each step must be a single, simple action.
-        *   *Bad:* "Process the PDF and extract emails."
-        *   *Good:* 1. "Read the text content from the PDF file 'document.pdf'." 2. "Analyze the extracted text to find all email addresses using regex."
-    *   **Assume No Context:** The coding agent is stateless. The first step should almost always be to explore the environment (e.g., "List all files in the current directory").
-    *   **Be Explicit:** Clearly mention file names or other specific details if they are known.
-    *   **Minimal Change:** Make sure each step will be very inclusive because the user might be asking for updating on existing code (Updating on the existing code will be more suitable via cli tool such as sed, awk etc)
-
-    **Output Format:**
-    Your final output **must** be a markdown-formatted checklist. Start with the header `# Project Plan` and list each step as a checklist item `- [ ]`.
-
-    **Example Output:**
-    ```markdown
-    # Project Plan
-
-    - [ ] Step 1: List all files in the current directory.
-    - [ ] Step 2: Read the content of the PDF file 'document.pdf'.
-    - [ ] Step 3: Analyze the extracted text to find all email addresses using a regular expression.
-    - [ ] Step 4: Save the found email addresses to a new file named 'emails.txt'.
-    But make each step into a sperate string list
+        Output Format:
+        A markdown checklist starting with "# Project Plan", each step as "- [ ]". Also return all steps as a separate list of strings.
+        But make each step into a sperate string list
     """
+    if os.path.exists(f"coding_space/{state['thread_id']}/todo.md"):
+        with open(f"coding_space/{state['thread_id']}/todo.md", "r") as f:
+            previous_todo = f.read()
+        system_prompt += f"\n NOTICE There is previous execution check any of them can be reusable before generating code\n {previous_todo}"
     message_sequence = state["internal_messages"] + [SystemMessage(content=system_prompt)]
-    response_tuple = await safely_ainvoke(model=code_planner_model, message_sequence=message_sequence)
+    response_tuple = await safely_ainvoke(model=code_planner_model, message_sequence=message_sequence, response_schema=Plans)
     # response = await code_planner_model.ainvoke(state["internal_messages"] + [SystemMessage(content=system_prompt)])
     if not response_tuple[0]:
         return Command(
@@ -147,18 +181,34 @@ async def code_planner_node(state: StateMessage)->Command[Literal["code_generato
     response = response_tuple[1]
     with open(f"coding_space/{state['thread_id']}/todo.md", "w") as f:
         f.write("\n".join(response.steps))
+    
+    event = message_event.Event(
+        type="coding_agent_planning",
+        sender="coding_agent",
+        content="coding agent is planning the code task",
+        timestamp = time(),
+        message_user = True
+    )
+    ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
+    await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
+
     return Command(
         goto="code_generator",
         update={
             **state,
             "internal_messages": state["internal_messages"] + [AIMessage(content="\n".join(response.steps))],
             "steps": response.steps,
-            "current_step_id": 0
+            "current_step_id": 0,
+            "problems": []
         }
     )
 
 
-code_generator_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key")).with_structured_output(CodeList)
+code_generator_model = ChatDeepSeek(
+    model="deepseek-chat", 
+    api_key=os.getenv("api_key"),
+    extra_body={"thinking": {"type": "disabled"}}
+).with_structured_output(CodeList)
 
 async def code_generator_node(state: StateMessage)->Command[Literal["agent_forward", "code_runner"]]:
     if state["current_step_id"] < len(state['steps']):
@@ -246,8 +296,17 @@ async def code_generator_node(state: StateMessage)->Command[Literal["agent_forwa
         else:
             message = HumanMessage(content=system_prompt)
         message_sequence = state["internal_messages"] + [message]
-        response_tuple = await safely_ainvoke(model=code_generator_model, message_sequence=message_sequence)
+        response_tuple = await safely_ainvoke(model=code_generator_model, message_sequence=message_sequence, response_schema=CodeList)
         if not response_tuple[0]:
+            event = message_event.Event(
+                type="coding_generator_fix_problems",
+                sender="coding_agent",
+                content="coding agent is fixing code bugs",
+                timestamp = time(),
+                message_user = True
+            )
+            ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
+            await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
             return Command(
                 goto="code_generator",
                 update={
@@ -257,9 +316,20 @@ async def code_generator_node(state: StateMessage)->Command[Literal["agent_forwa
             )
         response = response_tuple[1]
         if isinstance(response, CodeList) and (response.code_list or response.exe_cmd):
-            for each_cmd in response.exe_cmd:
-                if 'sed' in each_cmd:
-                    print(each_cmd)
+            # for each_cmd in response.exe_cmd:
+            #     if 'sed' in each_cmd:
+            #         print(each_cmd)
+
+            event = message_event.Event(
+                type="coding_generator_write_code",
+                sender="coding_agent",
+                content="coding agent is generating code and system cli",
+                timestamp = time(),
+                message_user = True
+            )
+            ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
+            await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
+
             return Command(
                 goto="code_runner",
                 update={
@@ -278,6 +348,16 @@ async def code_generator_node(state: StateMessage)->Command[Literal["agent_forwa
                 }
             )
     else:
+        event = message_event.Event(
+            type="coding_generator_fix_problems",
+            sender="coding_agent",
+            content="coding agent is fixing code bugs",
+            timestamp = time(),
+            message_user = True
+        )
+        ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
+        await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
+
         return Command(
             goto="agent_forward",
             update={
@@ -286,7 +366,11 @@ async def code_generator_node(state: StateMessage)->Command[Literal["agent_forwa
             }
         )
 
-todo_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key")).with_structured_output(Todo)
+todo_model = ChatDeepSeek(
+    model="deepseek-chat", 
+    api_key=os.getenv("api_key"),
+    extra_body={"thinking": {"type": "disabled"}}
+).with_structured_output(Todo)
 
 async def update_todo_md(*, steps: list[str], current_step_id: int, output: str, thread_id: str)->Todo:
     prompt = prompt = f"""
@@ -312,6 +396,16 @@ async def code_runner_node(state: StateMessage)->Command[Literal["code_generator
     This function is for saving the code into the code file and running the code in the sandbox environment
     return result of execution
     '''
+    event = message_event.Event(
+        type="coding_executor_run",
+        sender="coding_agent",
+        content="coding executor is running code",
+        timestamp = time(),
+        message_user = True
+    )
+    ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
+    await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
+
     codes: CodeList = state["problems"][-1].code_fix if state["problems"] else state["initial_code"]
     result_tuple = await asyncio.to_thread(lambda: run_docker_commands(thread_id=state["thread_id"], exe_cmds=codes.exe_cmd, code_files=codes.code_list))
     if result_tuple[0]: ##(bool, result(str))

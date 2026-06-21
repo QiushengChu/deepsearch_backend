@@ -4,7 +4,7 @@ from typing import List
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi import status, APIRouter, UploadFile, HTTPException, Depends
 from model.memory import checkpointer_manager
-from utils.helper_funcs import file_upload_handler, summary_fetcher
+from utils.helper_funcs import file_upload_handler
 import asyncio
 from model.file_parser import Chromadb_agent
 from model.dependency.dependencies import get_chromadb_agent_singleton, get_db
@@ -13,6 +13,7 @@ from sqlalchemy import delete
 from model.sqlite import SummaryIndex
 import mimetypes
 from urllib.parse import quote
+from model.session_manager import manager
 
 
 session_router =  APIRouter()
@@ -24,12 +25,6 @@ async def file_upload(
         chromadb_agent: Chromadb_agent = Depends(get_chromadb_agent_singleton)
     )->JSONResponse:
     try:
-        # session_exist = await checkpointer_manager.thread_checker(session_id=session_id)
-        # if not session_exist:
-        #     return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={
-        #         "error": f"session {session_id} does not exist.."
-        #     })
-        ##creating files async
         os.makedirs(f"uploads/{session_id}", exist_ok=True)
         corutines = [file_upload_handler(
             file=file, 
@@ -38,13 +33,16 @@ async def file_upload(
         ) for file in files]
 
         results = await asyncio.gather(*corutines)
-        failed_uploads = list(filter(lambda x: x["result"] == False, results))
+        session = manager.get_session(thread_id=session_id)
+        session["file_upload"] = results
+        # failed_uploads = list(filter(lambda x: x.== False, results))
+        
 
-        if failed_uploads:
-            failed_names = (", ").join([upload["name"] for upload in failed_uploads])
-            return JSONResponse(status_code=status.HTTP_201_CREATED, content=f"{failed_names} failed in uploads")
-        else:
-            return JSONResponse(status_code=status.HTTP_201_CREATED, content="files has been uploaded.")
+        # if failed_uploads:
+        #     failed_names = (", ").join([upload["name"] for upload in failed_uploads])
+        #     return JSONResponse(status_code=status.HTTP_201_CREATED, content=f"{failed_names} failed in uploads")
+        # else:
+        return JSONResponse(status_code=status.HTTP_201_CREATED, content="files has been uploaded.")
         
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Server Side Error: {e}")

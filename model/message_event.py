@@ -1,13 +1,15 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import List
 
 class Event(BaseModel):
-    type: str
-    sender: str
-    content: str
-    input_tokens: int
-    output_tokens: int
-    total_tokens: int
-    links: Optional[List[str]] = None
+    type: str = None
+    sender: str = None
+    content: str = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    links: List[str] = []
     timestamp: float
-    fileNames: Optional[List[str]] = None
+    fileNames: List[str] = []
+    message_user: bool = True
+    error: bool = False

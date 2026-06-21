@@ -24,15 +24,15 @@ class Chromadb_agent():
         )
         
     async def index_file(self, session_id: str, filename: str, text: str)->Dict[str, str]:
-        collection_name = f"{session_id}_{filename}".replace(" ", "_")
+        normalized_collection_name = Chromadb_agent.collection_name_normalize(session_id=session_id, filename=filename)
         ##if found the same file in chromadb remove it.
         existing_collections_name =  [each.name for each in self.chromadb_client.list_collections()]
-        if collection_name in existing_collections_name:
-            self.chromadb_client.delete_collection(collection_name)
+        if normalized_collection_name in existing_collections_name:
+            self.chromadb_client.delete_collection(normalized_collection_name)
         text_spliter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len, separators=["\n\n", "\n", ". ", " ", ""])
         chunks = text_spliter.split_text(text)
         formated_chunks = [{"chunk_id": i, "content": chunk, "word_count": len(chunk.split()), "char_count": len(chunk)} for i, chunk in enumerate(chunks)]
-        collection = self.chromadb_client.get_or_create_collection(name=collection_name)
+        collection = self.chromadb_client.get_or_create_collection(name=normalized_collection_name)
         documents, metadata, ids = [], [], []
         file_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -55,7 +55,7 @@ class Chromadb_agent():
             "filename": filename,
             "total_chunks": len(chunks),
             "total_characters": len(text),
-            "collection_name": collection_name,
+            "collection_name": normalized_collection_name,
             "chunks_stored": len(formated_chunks)
         }
     
@@ -80,3 +80,18 @@ class Chromadb_agent():
             return (f"Documents associated session_id {session_id} have been removed", True)
         except Exception as e:
             return (e, False)
+        
+    @staticmethod
+    def collection_name_normalize(session_id: str, filename: str)->str:
+        '''
+        following chromadb collection naming convention as convertion
+        '''
+        MAX_COLLECTION_NAME_LENGTH = 63
+        collection_name = f"{session_id}_{filename}"
+        if len(f"{session_id}_{filename}") > MAX_COLLECTION_NAME_LENGTH:
+            gap_len = len(f"{session_id}_{filename}") - MAX_COLLECTION_NAME_LENGTH
+            truncated_filename = "".join(filename.split(".")[:-1])[0: -gap_len] + "." + filename.split(".")[-1]
+            collection_name = f"{session_id}_{truncated_filename}"
+        return collection_name.replace(" ", "_")
+        
+

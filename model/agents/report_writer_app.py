@@ -16,17 +16,25 @@ load_dotenv()
 
 class Report_Writer_State(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    ui_messages: Annotated[Sequence[BaseMessage], add_messages]
     sender: str
     thread_id: str
     pause_required: bool
 
 class File_Generation_Check(BaseModel):
     related_file_generated: bool = Field(..., description="If there is any related file generated")
-    file_name: str = Field(..., description="the name of the related file")
+    file_names: list[str] = Field(..., description="the name of the related files")
     
 
-report_writer_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key"))
-file_generation_check_model = ChatDeepSeek(model="deepseek-chat", api_key=os.getenv("api_key")).with_structured_output(File_Generation_Check)
+report_writer_model = ChatDeepSeek(model="deepseek-chat", 
+    api_key=os.getenv("api_key"), 
+    extra_body={"thinking": {"type": "disabled"}}
+)
+file_generation_check_model = ChatDeepSeek(
+    model="deepseek-chat", 
+    api_key=os.getenv("api_key"),
+    extra_body={"thinking": {"type": "disabled"}}
+).with_structured_output(File_Generation_Check)
 #report_writer_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0)
 
 async def report_writer_agent(state: Report_Writer_State)-> Command[Literal["__end__"]]:
@@ -78,7 +86,7 @@ async def report_writer_agent(state: Report_Writer_State)-> Command[Literal["__e
     file_generation_prompt = "Please analyze the whole conversation and anwser if there is related file created by file_generator_app to user's requirement. If there is, return True and the file name. Otherwise return False and file name is None"
     file_check_result = await file_generation_check_model.ainvoke(state["messages"] + [SystemMessage(content=file_generation_prompt)])
     if file_check_result.related_file_generated:
-        system_prompt += f"\nIn the response, MUST include the newly created file via http://localhost:8000/api/file/coding_space/{state['thread_id']}/{file_check_result.file_name} in the way matching the user's prompt context"
+        system_prompt += f"\nIn the response, MUST include the newly created files via prefix http://localhost:8000/api/file/coding_space/{state['thread_id']}/ + {file_check_result.file_names} in the way matching the user's prompt context, using markdown format for file links"
 
     system_message = SystemMessage(content=system_prompt)
 
@@ -92,15 +100,19 @@ async def report_writer_agent(state: Report_Writer_State)-> Command[Literal["__e
         input_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         output_tokens = getattr(response, "usage_metadata", {}).get("input_tokens", 0),
         total_tokens = getattr(response, "usage_metadata", {}).get("total_tokens", 0),
-        timestamp = time()
+        timestamp = time(),
+        fileNames = file_check_result.file_names,
+        message_user = True
 
     )
     await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
-    response.additional_kwargs = {"message_user": True, "message_event": event}
+    await manager.send_event(thread_id=state["thread_id"], event=event.model_dump(), message_type="ui_message") ##for UI message streaming
+    response.additional_kwargs = event.model_dump()
     return Command(
         goto="__end__",
         update={
-            "messages": state["messages"] + [response],
+            "messages": [response],
+            "ui_messages": [response],
             "sender": "report_writer_agent",
             "thread_id": state["thread_id"]
         }
