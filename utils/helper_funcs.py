@@ -11,7 +11,7 @@ from pathlib import Path
 import docker
 import time
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from utils.file_content_extractor import file_content_extract
 from typing import Type
 from pydantic import BaseModel
@@ -73,7 +73,7 @@ async def file_upload_handler(file: File, session_id: str, chromadb_client: Chro
         file_content_result = await file_content_extract(file_path=file_path)
         if file_content_result[0]:
             num_tokens = await asyncio.to_thread(get_token_counts, file_content_result[1])
-            if num_tokens < MAX_INDEX_THRESHOLD:
+            if num_tokens > MAX_INDEX_THRESHOLD:
                 ##indexing the uploads
                 await chromadb_client.index_file(session_id=session_id,  filename=file.filename, text=file_content_result[1])
                 ##generate summary and save it into sqlite
@@ -202,49 +202,47 @@ def run_docker_commands(thread_id: str, exe_cmds: list[str], code_files: list[Co
         return (False, ";".join(results + [error_result]))
 
 
-async def safely_ainvoke(
+async def safely_ainvoke[T: BaseModel](
         *, 
         model: BaseChatModel, 
         message_sequence: list[BaseMessage], 
         null_response_model_switch: bool = True,
-        circuit_break_threshold: int = 3,
-        response_schema: Type[BaseModel] = None ##response schema type
-    )->tuple[bool, object]:
+        circuit_break_threshold: int = 4,
+        response_schema: type[T] = None ##response schema type
+    )->T | BaseMessage:
     '''
     async invoke response with data type validate and any other exception graceful handle,
     if null_response_model_switch is True if there are 3 consecvtive null response then switch model
     '''
     NULL_RESPONSE_ERROR = "LLM error: Reponse is None...Please retry"
+    response_sequence = [] ##seperate response sequence with raw message sequence
     if null_response_model_switch:
-        pos = 0
-        consecutive_counter = 0
-        consecutive_group = 0
-        while pos < len(message_sequence):
-            if NULL_RESPONSE_ERROR in message_sequence[pos].content:
-                consecutive_counter += 1
-                if consecutive_counter == circuit_break_threshold:
-                    consecutive_group += 1
-                    consecutive_counter = 0
-                    pos += 1
+        for _ in range(circuit_break_threshold):
+            try:
+                response = await model.ainvoke(message_sequence + response_sequence)
+                if response is None:
+                    response_sequence.append(HumanMessage(content=NULL_RESPONSE_ERROR))
+                    continue
                 else:
-                    pos += 2
-            else:
-                consecutive_counter = 0
-                pos += 1
-
-        if consecutive_group % 2:
-            ##model failover
-            failover_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0)
-            print("Failover to gpt-4o")
-            if response_schema:
-                model = failover_model.with_structured_output(response_schema)
-        else:
-            print("Using deepseek")
-
-    try:
-        response = await model.ainvoke(message_sequence)
-        if response is None:
-            raise ValueError(NULL_RESPONSE_ERROR)
-    except Exception as e:
-        return (False, str(e))
-    return (True, response)
+                    return response
+            except Exception as e: ##other error such as type error
+                response_sequence.append(HumanMessage(content=str(e)))
+                continue
+        ##failover to backup model
+        response_sequence = []
+        failover_model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("openai_api_key"), top_p=0.1, temperature=0)
+        if response_schema:
+            failover_model = failover_model.with_structured_output(response_schema)
+        print("Failover to gpt-4o")
+        for _ in range(circuit_break_threshold):
+            try:
+                response = await failover_model.ainvoke(message_sequence + response_sequence)
+                if response is None:
+                    response_sequence.append(HumanMessage(content=NULL_RESPONSE_ERROR))
+                    continue
+                else:
+                    return response
+            except Exception as e:
+                response_sequence.append(AIMessage(content=str(e)))
+                continue
+        raise Exception("Both primary and failover models are not working properly...")

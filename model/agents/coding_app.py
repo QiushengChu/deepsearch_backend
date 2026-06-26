@@ -44,17 +44,7 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
     if state.get("coding_task_complete", False):
         system_prompt = "As the coding task completed, specify either output_obj_path or output_result for the supervisor agent to send to user.."
 
-        response_tuple = await safely_ainvoke(model=agent_forward_model, message_sequence=state["internal_messages"] + [SystemMessage(content=system_prompt)], response_schema=AgentForward)
-        
-        if not response_tuple[0]: ## if exception 
-            return Command(
-                goto="agent_forward",
-                update={
-                    **state,
-                    "internal_messages": state["internal_messages"] +[SystemMessage(content=system_prompt)] + [HumanMessage(content=response_tuple[1])] ## attach exception message
-                }
-            )
-        response = response_tuple[1]
+        response = await safely_ainvoke(model=agent_forward_model, message_sequence=state["internal_messages"] + [SystemMessage(content=system_prompt)], response_schema=AgentForward)
         summary = response.task_complete_summary or "The coding task has been completed."
         if response.output_result:
             summary += f"\nOutput result: {response.output_result}"
@@ -98,16 +88,7 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
         """
         
         message_sequence = state["messages"] + [SystemMessage(content=system_prompt)]
-        response_tuple = await safely_ainvoke(model=agent_forward_model, message_sequence=message_sequence, response_schema=AgentForward)
-        if not response_tuple[0]:##exception happen
-            return Command(
-                goto="agent_forward",
-                update={
-                    **state,
-                    "internal_messages": message_sequence + [HumanMessage(content=response_tuple[1])] ## attach exception message
-                }
-            )
-        response = response_tuple[1]
+        response = await safely_ainvoke(model=agent_forward_model, message_sequence=message_sequence, response_schema=AgentForward)
         os.makedirs(name=f"coding_space/{state['thread_id']}", exist_ok=True)
         event = message_event.Event(
             type="coding_forard_agent_in_progress",
@@ -128,14 +109,6 @@ async def agent_forward_node(state: StateMessage)->Command[Literal["__end__", "c
                 "steps": []
             }
         )
-
-
-    
-# code_planner_model = ChatDeepSeek(
-#     model="deepseek-chat", 
-#     api_key=os.getenv("api_key"), 
-#     extra_body={"thinking": {"type": "disabled"}}
-# ).with_structured_output(Plans)
 
 code_planner_model = ChatOpenAI(
     model="gpt-4o", 
@@ -168,17 +141,9 @@ async def code_planner_node(state: StateMessage)->Command[Literal["code_generato
             previous_todo = f.read()
         system_prompt += f"\n NOTICE There is previous execution check any of them can be reusable before generating code\n {previous_todo}"
     message_sequence = state["internal_messages"] + [SystemMessage(content=system_prompt)]
-    response_tuple = await safely_ainvoke(model=code_planner_model, message_sequence=message_sequence, response_schema=Plans)
+    response = await safely_ainvoke(model=code_planner_model, message_sequence=message_sequence, response_schema=Plans)
+    response.steps.append("Final step: make sure all the generated files which user wants will be under project root directory NOT in child folder..")
     # response = await code_planner_model.ainvoke(state["internal_messages"] + [SystemMessage(content=system_prompt)])
-    if not response_tuple[0]:
-        return Command(
-            goto="code_planner",
-            update={
-                **state,
-                "internal_messages": message_sequence + [HumanMessage(content=response_tuple[1])] ## attach exception message
-            }
-        )
-    response = response_tuple[1]
     with open(f"coding_space/{state['thread_id']}/todo.md", "w") as f:
         f.write("\n".join(response.steps))
     
@@ -292,12 +257,6 @@ async def code_generator_node(state: StateMessage)->Command[Literal["agent_forwa
             3. Do NOT create versioned files (no script_v2.py, script_fixed.py)
             4. Overwrite the ORIGINAL file
             """
-            message = HumanMessage(content=human_prompt)
-        else:
-            message = HumanMessage(content=system_prompt)
-        message_sequence = state["internal_messages"] + [message]
-        response_tuple = await safely_ainvoke(model=code_generator_model, message_sequence=message_sequence, response_schema=CodeList)
-        if not response_tuple[0]:
             event = message_event.Event(
                 type="coding_generator_fix_problems",
                 sender="coding_agent",
@@ -307,19 +266,12 @@ async def code_generator_node(state: StateMessage)->Command[Literal["agent_forwa
             )
             ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
             await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
-            return Command(
-                goto="code_generator",
-                update={
-                    **state,
-                    "problems": [*state["problems"], Problem(stratch_notepad=str(response_tuple[1]), code_fix=None)]
-                }
-            )
-        response = response_tuple[1]
+            message = HumanMessage(content=human_prompt)
+        else:
+            message = HumanMessage(content=system_prompt)
+        message_sequence = state["internal_messages"] + [message]
+        response = await safely_ainvoke(model=code_generator_model, message_sequence=message_sequence, response_schema=CodeList)
         if isinstance(response, CodeList) and (response.code_list or response.exe_cmd):
-            # for each_cmd in response.exe_cmd:
-            #     if 'sed' in each_cmd:
-            #         print(each_cmd)
-
             event = message_event.Event(
                 type="coding_generator_write_code",
                 sender="coding_agent",
@@ -348,16 +300,15 @@ async def code_generator_node(state: StateMessage)->Command[Literal["agent_forwa
                 }
             )
     else:
-        event = message_event.Event(
-            type="coding_generator_fix_problems",
-            sender="coding_agent",
-            content="coding agent is fixing code bugs",
-            timestamp = time(),
-            message_user = True
-        )
-        ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
-        await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
-
+        # event = message_event.Event(
+        #     type="coding_generator_fix_problems",
+        #     sender="coding_agent",
+        #     content="coding agent is fixing code bugs",
+        #     timestamp = time(),
+        #     message_user = True
+        # )
+        # ### As sub agent will not be recorded in the main context, when refresh page there is no progressing message
+        # await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
         return Command(
             goto="agent_forward",
             update={

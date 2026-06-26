@@ -7,6 +7,7 @@ from langgraph.graph import START, StateGraph
 from langgraph.types import Command
 import model.message_event as message_event
 from utils.context import context_purifier
+from utils.helper_funcs import safely_ainvoke
 from time import time
 from model.session_manager import manager
 from dotenv import load_dotenv
@@ -91,8 +92,9 @@ async def report_writer_agent(state: Report_Writer_State)-> Command[Literal["__e
     system_message = SystemMessage(content=system_prompt)
 
     all_messages = converted_messages + [system_message]
-    response = await report_writer_model.ainvoke(all_messages)
-    print(response.text)
+    response = await safely_ainvoke(model=report_writer_model, message_sequence=all_messages, null_response_model_switch=True, circuit_break_threshold=3, response_schema=File_Generation_Check)
+    # response = await report_writer_model.ainvoke(all_messages)
+    # print(response.text)
     event = message_event.Event(
         type = "report_writer_event",
         sender = "report_writer_agent",

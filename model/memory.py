@@ -2,7 +2,6 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 import aiosqlite
 import os
 from dotenv import load_dotenv
-from datetime import datetime
 
 load_dotenv()
 
@@ -13,7 +12,7 @@ class CheckpointerManager:
     async def initialize(self):
         '''initialize the long-short memory checkpointer'''
         if self.checkpointer is None:
-            conn = await aiosqlite.connect(os.getenv("sqlite_db_langgraph_path"))
+            conn = aiosqlite.connect(os.getenv("sqlite_db_langgraph_path"))
             self.checkpointer = AsyncSqliteSaver(conn=conn)
         return self.checkpointer
     

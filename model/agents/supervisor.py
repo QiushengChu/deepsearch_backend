@@ -2,7 +2,7 @@ import os, asyncio
 from typing import Sequence, TypedDict, Annotated, Literal
 from langgraph.graph import START, StateGraph
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage, AIMessage, SystemMessage, HumanMessage
 from langgraph.graph.message import add_messages
 from model.request_models import ROUTE_JSON_SCHEMA, Route
 from langchain_deepseek import ChatDeepSeek
@@ -10,6 +10,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.types import Command
 from model.session_manager import manager
 from utils.context import prompt_fetcher_from_cache, prompt_remover_from_cache
+from utils.helper_funcs import safely_ainvoke
 # from concurrent.futures import ThreadPoolExecutor
 from utils.context import context_purifier
 from model import message_event, memory
@@ -170,7 +171,14 @@ async def supervisor_agent(
             )
             await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
             all_messages = state["messages"] + [SystemMessage(content=system_prompt)]
-            response = await supervisor_model.ainvoke(context_purifier(state_messages=all_messages))
+            response = await safely_ainvoke(
+                model=supervisor_model, 
+                message_sequence=context_purifier(state_messages=all_messages),
+                null_response_model_switch=True, 
+                circuit_break_threshold=2, 
+                response_schema=ROUTE_JSON_SCHEMA
+            )
+            # response = await supervisor_model.ainvoke(context_purifier(state_messages=all_messages))
             event = message_event.Event(
                 type = "supervisor_agent_routing",
                 sender = "supervisor_agent",
@@ -212,8 +220,14 @@ async def supervisor_agent(
             message_user = True
         )
         await manager.send_event(thread_id=state["thread_id"], event=event.model_dump())
-        
-        response = await supervisor_model.ainvoke(context_purifier(state_messages=all_messages))
+        response = await safely_ainvoke(
+            model=supervisor_model,
+            message_sequence=context_purifier(state_messages=all_messages),
+            null_response_model_switch=True,
+            circuit_break_threshold=2,
+            response_schema=ROUTE_JSON_SCHEMA
+        )
+        #response = await supervisor_model.ainvoke(context_purifier(state_messages=all_messages))
         event = message_event.Event(
             type = "supervisor_agent_routing",
             sender = "supervisor_agent",
@@ -260,6 +274,4 @@ supervisor_app_graph.add_edge("file_search_app", "supervisor_agent")
 # supervisor_app_graph.add_edge("file_generator_app", "supervisor_agent")
 supervisor_app_graph.add_edge("coding_app", "supervisor_agent")
 
-
-
-supervisor_app = supervisor_app_graph.compile(checkpointer=memory.checkpointer_manager.initialize())
+#supervisor_app = supervisor_app_graph.compile(checkpointer=memory.checkpointer_manager.initialize())
